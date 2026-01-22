@@ -12,7 +12,7 @@ import json
 import logging
 from datetime import datetime
 from time import mktime
-from typing import AsyncGenerator, Callable, Optional
+from typing import AsyncGenerator, Callable, Optional, Any
 from urllib.parse import urlencode
 from wsgiref.handlers import format_date_time
 
@@ -221,6 +221,8 @@ class RealtimeTTSSession:
         input_queue: asyncio.Queue,
         output_queue: asyncio.Queue,
         config: Optional[TTSConfig] = None,
+        on_tts_start: Optional[Callable[[str], Any]] = None,
+        on_tts_end: Optional[Callable[[], Any]] = None,
     ):
         self.input_queue = input_queue
         self.output_queue = output_queue
@@ -228,6 +230,8 @@ class RealtimeTTSSession:
         self._running = False
         self._task: Optional[asyncio.Task] = None
         self._interrupted = asyncio.Event()
+        self._on_tts_start = on_tts_start
+        self._on_tts_end = on_tts_end
     
     async def start(self) -> None:
         """启动TTS会话"""
@@ -275,6 +279,14 @@ class RealtimeTTSSession:
                     continue
                 
                 logger.info(f"TTS开始合成: {text[:30]}...")
+                # 通知开始（用于状态机切换到SPEAKING）
+                if self._on_tts_start:
+                    try:
+                        res = self._on_tts_start(text)
+                        if asyncio.iscoroutine(res):
+                            await res
+                    except Exception as e:
+                        logger.warning(f"TTS开始回调出错: {e}")
                 
                 # 流式合成
                 async for audio_chunk in self.client.synthesize(text):
@@ -284,6 +296,15 @@ class RealtimeTTSSession:
                     
                     await self.output_queue.put(audio_chunk)
                 
+                # 合成结束，通知状态机
+                if self._on_tts_end:
+                    try:
+                        res = self._on_tts_end()
+                        if asyncio.iscoroutine(res):
+                            await res
+                    except Exception as e:
+                        logger.warning(f"TTS结束回调出错: {e}")
+
             except asyncio.CancelledError:
                 break
             except Exception as e:

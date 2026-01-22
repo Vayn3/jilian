@@ -149,7 +149,7 @@ class ResponseParser:
         
         if flags & 0x04:  # HAS_EVENT
             if len(payload) >= 4:
-                resp.event = struct.unpack(">I", payload[:4])[0]
+                resp.event = struct.unpack(">i", payload[:4])[0]
                 payload = payload[4:]
         
         # message_type
@@ -158,9 +158,11 @@ class ResponseParser:
                 resp.payload_size = struct.unpack(">I", payload[:4])[0]
                 payload = payload[4:]
         elif message_type == MessageType.SERVER_ERROR_RESPONSE:
-            if len(payload) >= 4:
-                resp.code = struct.unpack(">I", payload[:4])[0]
-                payload = payload[4:]
+            # 错误响应包含 code(int32) + payload_size(uint32)
+            if len(payload) >= 8:
+                resp.code = struct.unpack(">i", payload[:4])[0]
+                resp.payload_size = struct.unpack(">I", payload[4:8])[0]
+                payload = payload[8:]
         
         if not payload:
             return resp
@@ -177,8 +179,17 @@ class ResponseParser:
         if serialization_method == SerializationType.JSON:
             try:
                 resp.payload_msg = json.loads(payload.decode("utf-8"))
+            except UnicodeDecodeError as e:
+                logger.warning(f"JSON解码失败(非UTF-8编码): {e}, 长度: {len(payload)}")
+                # 尝试其他编码
+                try:
+                    resp.payload_msg = json.loads(payload.decode("gbk"))
+                except Exception:
+                    pass
+            except json.JSONDecodeError as e:
+                logger.warning(f"JSON解析失败: {e}, 长度: {len(payload)}")
             except Exception as e:
-                logger.warning(f"JSON解析失败: {e}")
+                logger.warning(f"JSON解析异常: {e}")
         
         return resp
 
@@ -257,6 +268,7 @@ class ASRClient:
         
         if is_last:
             header.with_message_type_specific_flags(MessageTypeSpecificFlags.NEG_WITH_SEQUENCE)
+            seq = -abs(seq)
         else:
             header.with_message_type_specific_flags(MessageTypeSpecificFlags.POS_SEQUENCE)
         

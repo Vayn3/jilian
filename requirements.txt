@@ -1,16 +1,16 @@
-# 级联式武汉话实时语音对话系统依赖
+# Cascaded Wuhan dialect real-time voice dialogue system dependencies
 
-# 异步HTTP客户端（豆包ASR）
+# Async HTTP client (Doubao ASR)
 aiohttp>=3.8.0
 
-# WebSocket客户端（讯飞TTS）
+# WebSocket client (iFlytek TTS)
 websockets>=10.0
 
-# OpenAI兼容客户端（千问LLM）
+# OpenAI compatible client (Qianwen LLM)
 openai>=1.0.0
 
-# 音频处理
+# Audio processing
 pyaudio>=0.2.11
 numpy>=1.20.0
 
-# 其他依赖
+# Other dependencies

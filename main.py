@@ -126,6 +126,8 @@ class VoiceDialogSystem:
             input_queue=self.llm_queue,
             output_queue=self.tts_queue,
             config=self.config.tts,
+            on_tts_start=self._on_tts_start,
+            on_tts_end=self._on_tts_end,
         )
         
         # 注册打断回调
@@ -141,6 +143,14 @@ class VoiceDialogSystem:
             self.tts_session.interrupt()
         if self.audio_player:
             self.audio_player.interrupt()
+
+    async def _on_tts_start(self, text: str) -> None:
+        """TTS开始时通知状态机进入SPEAKING"""
+        await self.dialog_manager.handle_llm_sentence(text)
+
+    async def _on_tts_end(self) -> None:
+        """TTS结束时回到IDLE"""
+        await self.dialog_manager.handle_tts_end()
     
     async def start(self) -> None:
         """启动系统"""
@@ -294,7 +304,13 @@ class VoiceDialogSystem:
                 final_text = ""
                 async for resp in client.receive_responses():
                     if resp.code != 0:
-                        logger.error(f"ASR错误: {resp.code}")
+                        err_detail = None
+                        if resp.payload_msg:
+                            err_detail = resp.payload_msg.get("message") or resp.payload_msg.get("msg") or resp.payload_msg
+                        if err_detail:
+                            logger.error(f"ASR错误: {resp.code}, 详情: {err_detail}")
+                        else:
+                            logger.error(f"ASR错误: {resp.code}")
                         break
                     
                     text = resp.get_text()
