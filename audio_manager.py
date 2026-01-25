@@ -2,11 +2,15 @@
 """
 音频管理模块 - 麦克风采集、音频播放、回声消除
 支持全双工音频处理，实现同时录音和播放
+支持 PyAudio 本地播放 / ROS1 话题发布双模式
+支持 UDP 动作关键词发送和 MIC 指令控制
 """
 
 import asyncio
 import audioop
+import json
 import logging
+import socket
 import threading
 import time
 from collections import deque
@@ -16,6 +20,7 @@ import numpy as np
 import pyaudio
 
 from config import get_config, AudioConfig
+from ros_audio import Ros1SpeakerStream, is_ros_available
 
 logger = logging.getLogger(__name__)
 
@@ -361,10 +366,98 @@ class AudioCapture:
             self.ns.reset()
 
 
+# ================== UDP 动作控制器 ==================
+class UDPActionController:
+    """
+    UDP 动作控制器
+    发送语音关键词和 MIC 指令到下位机
+    """
+    
+    def __init__(self):
+        self._config = get_config()
+        
+        # 语音关键词 UDP socket
+        self._voice_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        
+        # MIC 指令 UDP socket
+        self._mic_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    
+    def emit_voice_keyword(self, keyword: str) -> None:
+        """
+        发送语音关键词到下位机
+        
+        Args:
+            keyword: 关键词标签（如 wave/nod/shake/woshou/end 等）
+        """
+        if not self._config.enable_keyword_detection:
+            return
+        
+        try:
+            now = time.time()
+            msg = json.dumps({
+                "type": "voice_keyword",
+                "keyword": keyword,
+                "timestamp": now
+            })
+            self._voice_socket.sendto(
+                msg.encode("utf-8"),
+                (self._config.voice_udp_host, self._config.voice_udp_port)
+            )
+            logger.info(f"[KWS] 发送语音关键词：{keyword}")
+        except Exception as e:
+            logger.error(f"[KWS] 发送UDP失败: {e}")
+    
+    def send_mic_command(self, command: str) -> None:
+        """
+        发送 MIC 指令到下位机
+        
+        Args:
+            command: 指令名称（"send_microphone" 或 "release_microphone"）
+        """
+        try:
+            now = time.time()
+            msg = json.dumps({
+                "type": "mic_command",
+                "command": command,
+                "timestamp": now
+            })
+            self._mic_socket.sendto(
+                msg.encode("utf-8"),
+                (self._config.mic_udp_host, self._config.mic_udp_port)
+            )
+            logger.info(f"[MIC-UDP:{self._config.mic_udp_port}] 发送指令：{command}")
+        except Exception as e:
+            logger.error(f"[MIC-UDP] 发送失败: {e}")
+    
+    def close(self) -> None:
+        """关闭 UDP sockets"""
+        try:
+            self._voice_socket.close()
+        except Exception:
+            pass
+        try:
+            self._mic_socket.close()
+        except Exception:
+            pass
+
+
+# 全局 UDP 控制器实例
+_udp_controller: Optional[UDPActionController] = None
+
+
+def get_udp_controller() -> UDPActionController:
+    """获取全局 UDP 控制器"""
+    global _udp_controller
+    if _udp_controller is None:
+        _udp_controller = UDPActionController()
+    return _udp_controller
+
+
 # ================== 音频播放器 ==================
 class AudioPlayer:
     """
     实时音频播放器
+    支持 PyAudio 本地播放和 ROS1 话题发布双模式
     支持打断和回声消除参考信号更新
     """
     
@@ -376,14 +469,25 @@ class AudioPlayer:
         self.config = config or get_config().audio
         self.aec_callback = aec_callback  # 回调用于更新AEC参考信号
         
+        # 输出模式
+        self._output_mode = (self.config.output_mode or "pyaudio").lower()
+        
+        # PyAudio 相关
         self.pa: Optional[pyaudio.PyAudio] = None
-        self.stream: Optional[pyaudio.Stream] = None
+        self.stream = None  # 可以是 PyAudio Stream 或 Ros1SpeakerStream
+        
         self._is_playing = False
         self._interrupted = threading.Event()
         self._lock = threading.Lock()
+        
+        # UDP 控制器
+        self._udp_controller = get_udp_controller()
     
     def _check_output_device(self, device_index: Optional[int]) -> bool:
-        """检查输出设备"""
+        """检查输出设备（仅 PyAudio 模式）"""
+        if self._output_mode != "pyaudio":
+            return True
+        
         if not self.pa:
             self.pa = pyaudio.PyAudio()
         
@@ -419,6 +523,22 @@ class AudioPlayer:
         if self.stream is not None:
             return
         
+        if self._output_mode == "ros1":
+            # ROS1 模式
+            if not is_ros_available():
+                logger.warning("未检测到 ROS1，回退到 PyAudio 模式")
+                self._output_mode = "pyaudio"
+            else:
+                self.stream = Ros1SpeakerStream(
+                    topic=self.config.ros1_topic,
+                    node_name=self.config.ros1_node_name,
+                    queue_size=self.config.ros1_queue_size,
+                    latched=self.config.ros1_latch,
+                )
+                logger.info(f"使用 ROS1 模式发布音频到 {self.config.ros1_topic}")
+                return
+        
+        # PyAudio 模式
         if not self.pa:
             self.pa = pyaudio.PyAudio()
         
@@ -434,6 +554,7 @@ class AudioPlayer:
             output_device_index=self.config.output_device_index,
             frames_per_buffer=self.config.output_buffer_size,
         )
+        logger.info("使用 PyAudio 模式本地播放")
     
     def play(self, audio_data: bytes) -> bool:
         """
@@ -457,6 +578,7 @@ class AudioPlayer:
                 if self.aec_callback:
                     self.aec_callback(audio_data)
                 
+                # 写入音频数据（PyAudio 或 ROS1 都用 write 方法）
                 self.stream.write(audio_data)
                 return True
                 
@@ -465,6 +587,10 @@ class AudioPlayer:
                 return False
             finally:
                 self._is_playing = False
+    
+    def on_playback_complete(self) -> None:
+        """播放完成回调，发送递麦克风信号"""
+        self._udp_controller.send_mic_command("send_microphone")
     
     def interrupt(self) -> None:
         """打断播放"""
@@ -483,8 +609,10 @@ class AudioPlayer:
     def close(self) -> None:
         """关闭播放器"""
         if self.stream:
-            self.stream.stop_stream()
-            self.stream.close()
+            if hasattr(self.stream, 'stop_stream'):
+                self.stream.stop_stream()
+            if hasattr(self.stream, 'close'):
+                self.stream.close()
             self.stream = None
         
         if self.pa:
@@ -550,6 +678,8 @@ class RealtimeAudioPlaySession:
                 audio_data = await self.input_queue.get()
                 
                 if audio_data is None:  # 一轮结束标记
+                    # 播放完成，发送递麦克风信号
+                    self.player.on_playback_complete()
                     continue
                 
                 # 在线程池中播放（避免阻塞事件循环）

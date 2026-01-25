@@ -2,6 +2,7 @@
 """
 TTS客户端模块 - 讯飞语音合成（武汉话）
 基于WebSocket流式合成，支持实时音频输出
+支持 LLM 关键词检测并发送 UDP 动作指令
 """
 
 import asyncio
@@ -12,13 +13,15 @@ import json
 import logging
 from datetime import datetime
 from time import mktime
-from typing import AsyncGenerator, Callable, Optional, Any
+from typing import AsyncGenerator, Callable, Optional, Any, Set
 from urllib.parse import urlencode
 from wsgiref.handlers import format_date_time
 
 import websockets
 
 from config import get_config, TTSConfig
+from audio_constants import LLM_KWS_PATTERNS
+from audio_manager import get_udp_controller
 
 logger = logging.getLogger(__name__)
 
@@ -214,6 +217,7 @@ class RealtimeTTSSession:
     """
     实时TTS会话管理器
     从输入队列读取文本，流式合成音频，推送到输出队列
+    支持 LLM 关键词检测并发送 UDP 动作指令
     """
     
     def __init__(
@@ -232,6 +236,14 @@ class RealtimeTTSSession:
         self._interrupted = asyncio.Event()
         self._on_tts_start = on_tts_start
         self._on_tts_end = on_tts_end
+        
+        # LLM 关键词检测缓冲区
+        self._llm_keyword_buffer: str = ""
+        self._llm_buffer_max_len: int = 50  # 只保留最近若干字符
+        self._llm_kws_fired: Set[str] = set()  # 当前轮已触发的关键词
+        
+        # UDP 控制器
+        self._udp_controller = get_udp_controller()
     
     async def start(self) -> None:
         """启动TTS会话"""
@@ -263,6 +275,35 @@ class RealtimeTTSSession:
         """恢复合成"""
         self._interrupted.clear()
     
+    def _detect_llm_keywords(self, text: str) -> None:
+        """
+        检测 LLM 输出文本中的关键词并发送 UDP 指令
+        
+        Args:
+            text: LLM 输出的文本（一句话）
+        """
+        # 累积到缓冲区
+        self._llm_keyword_buffer += text
+        if len(self._llm_keyword_buffer) > self._llm_buffer_max_len:
+            self._llm_keyword_buffer = self._llm_keyword_buffer[-self._llm_buffer_max_len:]
+        
+        buf = self._llm_keyword_buffer
+        
+        # 遍历 LLM_KWS_PATTERNS，检测关键短语
+        for keyword, patterns in LLM_KWS_PATTERNS.items():
+            # 本轮已经触发过的 keyword 不再重复触发
+            if keyword in self._llm_kws_fired:
+                continue
+            
+            if any(p in buf for p in patterns):
+                self._udp_controller.emit_voice_keyword(keyword)
+                logger.info(f"[LLM-KWS] 检测到关键词 '{keyword}', 已发送 UDP 消息")
+                self._llm_kws_fired.add(keyword)
+                
+                # 如果是 end，清空缓冲
+                if keyword == "end":
+                    self._llm_keyword_buffer = ""
+    
     async def _run(self) -> None:
         """运行处理循环"""
         while self._running:
@@ -273,12 +314,19 @@ class RealtimeTTSSession:
                 if text is None:  # 一轮对话结束标记
                     # 发送结束标记到音频队列
                     await self.output_queue.put(None)
+                    # 重置关键词检测状态
+                    self._llm_keyword_buffer = ""
+                    self._llm_kws_fired.clear()
                     continue
                 
                 if self._interrupted.is_set():
                     continue
                 
                 logger.info(f"TTS开始合成: {text[:30]}...")
+                
+                # LLM 关键词检测
+                self._detect_llm_keywords(text)
+                
                 # 通知开始（用于状态机切换到SPEAKING）
                 if self._on_tts_start:
                     try:

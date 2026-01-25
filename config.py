@@ -66,7 +66,7 @@ class LLMConfig:
 请注意：
 1. 回答要简洁明了，适合语音播报
 2. 避免使用特殊符号、表情、代码块等不适合语音的内容
-3. 回答长度适中，一般不超过3-4句话
+3. 回答长度适中，一般不超过5句话
 4. 语气自然亲切"""
     
     # 对话历史
@@ -137,6 +137,16 @@ class AudioConfig:
     enable_agc: bool = True  # 启用自动增益
     agc_target_level: int = 3  # AGC目标电平 0-31
     
+    # ========== 播放模式配置 ==========
+    # 输出模式: "pyaudio" = 本地扬声器播放, "ros1" = ROS话题发布
+    output_mode: str = "pyaudio"
+    
+    # ROS1 扬声器发布配置（仅当 output_mode="ros1" 时生效）
+    ros1_topic: str = "/audio"  # ROS 话题名
+    ros1_node_name: str = "speaker_publisher"  # ROS 节点名
+    ros1_queue_size: int = 10  # 发布队列大小
+    ros1_latch: bool = False  # 是否使用 latched 模式
+    
     @property
     def bytes_per_frame(self) -> int:
         """每帧字节数"""
@@ -181,6 +191,18 @@ class SystemConfig:
     # 打断配置
     enable_barge_in: bool = True  # 启用打断功能
     barge_in_threshold: int = 600  # 打断检测能量阈值
+    
+    # ========== UDP 动作控制配置 ==========
+    # 语音关键词 UDP 通道（发送动作指令给下位机）
+    voice_udp_host: str = "127.0.0.1"
+    voice_udp_port: int = 5557
+    
+    # MIC 指令 UDP 通道（发送收/递麦克风指令）
+    mic_udp_host: str = "127.0.0.1"
+    mic_udp_port: int = 5558
+    
+    # 关键词检测开关
+    enable_keyword_detection: bool = True  # 启用关键词检测
     
     def to_dict(self) -> Dict[str, Any]:
         """转换为字典"""

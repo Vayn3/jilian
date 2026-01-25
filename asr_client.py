@@ -2,6 +2,7 @@
 """
 ASR客户端模块 - 豆包流式语音识别
 基于双向流式优化版API，支持实时识别和VAD
+支持 ASR 关键词检测并发送 UDP 动作指令
 """
 
 import asyncio
@@ -15,6 +16,8 @@ from typing import AsyncGenerator, Callable, Dict, List, Optional, Any
 import aiohttp
 
 from config import get_config, ASRConfig
+from audio_constants import ASR_KWS_PATTERNS
+from audio_manager import get_udp_controller
 
 logger = logging.getLogger(__name__)
 
@@ -413,11 +416,53 @@ class ASRClient:
             logger.error(f"发送音频出错: {e}")
 
 
+# ================== ASR 关键词检测器 ==================
+class ASRKeywordDetector:
+    """
+    ASR 关键词检测器
+    检测用户语音识别结果中的动作关键词并发送 UDP 指令
+    """
+    
+    def __init__(self):
+        self._udp_controller = get_udp_controller()
+    
+    def detect_and_emit(self, text: str) -> None:
+        """
+        检测 ASR 识别文本中的关键词并发送 UDP 指令
+        
+        Args:
+            text: ASR 识别出的文本
+        """
+        if not text:
+            return
+        
+        # 遍历 ASR_KWS_PATTERNS，检测关键短语
+        for keyword, patterns in ASR_KWS_PATTERNS.items():
+            if any(p in text for p in patterns):
+                self._udp_controller.emit_voice_keyword(keyword)
+                logger.info(f"[ASR-KWS] 检测到关键词 '{keyword}', 已发送 UDP 消息")
+                # 找到一个就触发，可以 break 或继续检测其他
+                break
+
+
+# 全局 ASR 关键词检测器
+_asr_kw_detector: Optional[ASRKeywordDetector] = None
+
+
+def get_asr_keyword_detector() -> ASRKeywordDetector:
+    """获取全局 ASR 关键词检测器"""
+    global _asr_kw_detector
+    if _asr_kw_detector is None:
+        _asr_kw_detector = ASRKeywordDetector()
+    return _asr_kw_detector
+
+
 # ================== 实时ASR会话 ==================
 class RealtimeASRSession:
     """
     实时ASR会话管理器
     支持从音频队列持续识别，并将结果推送到输出队列
+    支持 ASR 关键词检测并发送 UDP 动作指令
     """
     
     def __init__(
@@ -432,6 +477,12 @@ class RealtimeASRSession:
         self.client: Optional[ASRClient] = None
         self._running = False
         self._task: Optional[asyncio.Task] = None
+        
+        # ASR 关键词检测器
+        self._kw_detector = get_asr_keyword_detector()
+        
+        # UDP 控制器（用于发送收麦克风信号）
+        self._udp_controller = get_udp_controller()
     
     async def start(self) -> None:
         """启动ASR会话"""
@@ -455,6 +506,12 @@ class RealtimeASRSession:
             await self.client.close()
         logger.info("ASR会话已停止")
     
+    def _on_asr_result(self, text: str) -> None:
+        """ASR 识别结果回调，进行关键词检测"""
+        logger.info(f"ASR识别: {text}")
+        # 检测关键词并发送 UDP
+        self._kw_detector.detect_and_emit(text)
+    
     async def _run(self) -> None:
         """运行识别循环"""
         async with ASRClient(self.config) as client:
@@ -464,9 +521,12 @@ class RealtimeASRSession:
                 try:
                     async for text in client.recognize_stream(
                         self.input_queue,
-                        definite_callback=lambda t: logger.info(f"ASR识别: {t}")
+                        definite_callback=self._on_asr_result
                     ):
                         if text:
+                            # 发送收麦克风信号（用户说完话了）
+                            self._udp_controller.send_mic_command("release_microphone")
+                            
                             await self.output_queue.put(text)
                             logger.info(f"ASR输出: {text}")
                 except Exception as e:
