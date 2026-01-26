@@ -12,5 +12,10 @@ openai>=1.0.0
 # Audio processing
 pyaudio>=0.2.11
 numpy>=1.20.0
+scipy>=1.7.0
+
+# ROS1 support
+pyyaml>=6.0
+rospkg>=1.6.0
 
 # Other dependencies
