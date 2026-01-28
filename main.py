@@ -181,13 +181,13 @@ class VoiceDialogSystem:
             asyncio.create_task(self._asr_loop()),
         ]
 
+        logger.info("系统启动完成！")
+        logger.info(f"当前模型: {self.config.llm.model}")
+        logger.info(f"TTS发音人: {self.config.tts.vcn} (武汉话)")
+        logger.info(f"回声消除: {'启用' if self.config.audio.enable_aec else '禁用'}")
+        logger.info(f"打断功能: {'启用' if self.config.enable_barge_in else '禁用'}")
         logger.info("-" * 50)
-        logger.info(f"模型: {self.config.llm.model} | TTS: {self.config.tts.vcn}")
-        logger.info(
-            f"输出模式: {self.config.audio.output_mode} | 关键词检测: {'开' if self.config.enable_keyword_detection else '关'}"
-        )
-        logger.info("-" * 50)
-        logger.info("✓ 系统就绪，请开始说话...")
+        logger.info("请开始说话...")
 
     async def stop(self) -> None:
         """停止系统"""
@@ -281,6 +281,10 @@ class VoiceDialogSystem:
             await self.dialog_manager.reset()
             return
 
+        logger.info(
+            f"开始ASR识别，原始音频长度: {len(audio_data)} bytes ({self.config.audio.sample_rate}Hz)"
+        )
+
         # 重采样：从麦克风采样率转换到ASR期望的采样率
         if self.config.audio.sample_rate != self.config.asr.sample_rate:
             try:
@@ -298,6 +302,10 @@ class VoiceDialogSystem:
 
                 # 转换回int16并转为bytes
                 audio_data = resampled_array.astype(np.int16).tobytes()
+
+                logger.info(
+                    f"重采样完成: {self.config.audio.sample_rate}Hz -> {self.config.asr.sample_rate}Hz, 新长度: {len(audio_data)} bytes"
+                )
             except Exception as e:
                 logger.error(f"重采样失败: {e}")
                 await self.dialog_manager.reset()
@@ -342,18 +350,21 @@ class VoiceDialogSystem:
                         break
 
                     text = resp.get_text()
+                    if text:
+                        logger.info(f"ASR中间结果: {text}")
 
                     if resp.is_last_package:
                         final_text = resp.get_text()
                         break
 
                 if final_text:
-                    logger.info(f"[用户] {final_text}")
+                    logger.info(f"ASR最终结果: {final_text}")
                     await self.dialog_manager.handle_asr_result(final_text)
 
                     # 发送到LLM
                     await self.asr_queue.put(final_text)
                 else:
+                    logger.info("ASR未识别到有效文本")
                     await self.dialog_manager.reset()
 
         except Exception as e:

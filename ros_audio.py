@@ -4,10 +4,7 @@ ROS1 音频发布模块
 支持将音频数据发布到 ROS 话题，供下位机播放
 """
 
-import logging
 from typing import Optional
-
-logger = logging.getLogger(__name__)
 
 # ---------- ROS 相关导入 ----------
 try:
@@ -16,7 +13,6 @@ try:
 
     try:
         from audio_common_msgs.msg import AudioData as RosAudioData
-
         _HAS_AUDIO_DATA_MSG: bool = True
     except Exception:
         RosAudioData = None
@@ -35,12 +31,12 @@ class Ros1SpeakerStream:
     """
     ROS1 扬声器音频发布流
     将 PCM 音频数据发布到 ROS 话题，供下位机订阅并播放
-
+    
     支持两种消息类型：
     - audio_common_msgs/AudioData（优先）
     - std_msgs/ByteMultiArray（兜底）
     """
-
+    
     def __init__(
         self,
         topic: str = "/robot/speaker/audio",
@@ -50,7 +46,7 @@ class Ros1SpeakerStream:
     ):
         """
         初始化 ROS1 扬声器发布流
-
+        
         Args:
             topic: ROS 话题名称
             node_name: ROS 节点名称（如尚未初始化则自动创建）
@@ -59,51 +55,51 @@ class Ros1SpeakerStream:
         """
         if not _HAS_ROS1:
             raise RuntimeError("未检测到 ROS1 (rospy)。请在 ROS1 环境运行。")
-
+        
         # 如果 ROS 节点尚未初始化，则自动初始化
         if not rospy.core.is_initialized():
             rospy.init_node(node_name, anonymous=True, disable_signals=True)
-
+        
         self.topic = topic
         self._use_audio_msg = _HAS_AUDIO_DATA_MSG
-
+        
         # 根据可用的消息类型创建发布者
         if self._use_audio_msg:
             self._pub = rospy.Publisher(
                 topic, RosAudioData, queue_size=queue_size, latch=latched
             )
-            logger.info(f"ROS音频发布器已创建: {topic} (AudioData)")
+            print(f"[ROS-AUDIO] 使用 audio_common_msgs/AudioData 发布到 {topic}")
         else:
             self._pub = rospy.Publisher(
                 topic, ByteMultiArray, queue_size=queue_size, latch=latched
             )
-            logger.info(f"ROS音频发布器已创建: {topic} (ByteMultiArray)")
-
+            print(f"[ROS-AUDIO] 使用 std_msgs/ByteMultiArray 发布到 {topic}")
+        
         self._closed = False
-
+    
     def write(self, audio_bytes: bytes) -> None:
         """
         发布音频数据到 ROS 话题
-
+        
         Args:
             audio_bytes: PCM 音频数据
         """
         if self._closed:
             return
-
+        
         if self._use_audio_msg:
             msg = RosAudioData()
             msg.data = list(audio_bytes)
         else:
             msg = ByteMultiArray()
             msg.data = list(audio_bytes)
-
+        
         self._pub.publish(msg)
-
+    
     def stop_stream(self) -> None:
         """停止流（兼容 PyAudio 接口）"""
         pass
-
+    
     def close(self) -> None:
         """关闭发布者"""
         self._closed = True
