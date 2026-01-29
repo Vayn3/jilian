@@ -64,7 +64,7 @@ class LLMConfig:
     stream: bool = True
 
     # System Prompt
-    system_prompt: str = """你是一个友好的AI助手，正在和用户进行语音对话。
+    system_prompt: str = """你是一个友好的AI助手，你叫小科，正在和用户进行语音对话。
 请注意：
 1. 回答要简洁明了，适合语音播报
 2. 避免使用特殊符号、表情、代码块等不适合语音的内容
@@ -209,6 +209,10 @@ class SystemConfig:
     # 打断配置
     enable_barge_in: bool = True  # 启用打断功能
     barge_in_threshold: int = 600  # 打断检测能量阈值
+
+    # ========== 启动欢迎语配置 ==========
+    # 系统启动时自动播放的欢迎语（设为空字符串则不播放）
+    welcome_message: str = "大家好，我是华科机器人小科，很高兴见到你！"
 
     # ========== UDP 动作控制配置 ==========
     # 语音关键词 UDP 通道（发送动作指令给下位机）

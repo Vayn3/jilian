@@ -422,9 +422,7 @@ class AudioCapture:
             )
 
             self.stream.start_stream()
-            logger.info(
-                f"音频采集已启动 (采样率: {self.config.sample_rate}, 通道: {self.config.channels})"
-            )
+            logger.debug(f"音频采集已启动 @ {self.config.sample_rate}Hz")
 
         except Exception as e:
             logger.error(f"启动音频采集失败: {e}")
@@ -444,7 +442,7 @@ class AudioCapture:
             self.pa.terminate()
             self.pa = None
 
-        logger.info("音频采集已停止")
+        logger.debug("音频采集已停止")
 
     def reset_aec(self) -> None:
         """重置回声消除器"""
@@ -492,9 +490,9 @@ class UDPActionController:
                 msg.encode("utf-8"),
                 (self._config.voice_udp_host, self._config.voice_udp_port),
             )
-            logger.info(f"[KWS] 发送语音关键词：{keyword}")
+            logger.info(f"[UDP:{self._config.voice_udp_port}] 动作指令: {keyword}")
         except Exception as e:
-            logger.error(f"[KWS] 发送UDP失败: {e}")
+            logger.error(f"[UDP] 发送动作指令失败: {e}")
 
     def send_mic_command(self, command: str) -> None:
         """
@@ -512,9 +510,9 @@ class UDPActionController:
                 msg.encode("utf-8"),
                 (self._config.mic_udp_host, self._config.mic_udp_port),
             )
-            logger.info(f"[MIC-UDP:{self._config.mic_udp_port}] 发送指令：{command}")
+            logger.info(f"[UDP:{self._config.mic_udp_port}] MIC指令: {command}")
         except Exception as e:
-            logger.error(f"[MIC-UDP] 发送失败: {e}")
+            logger.error(f"[UDP] MIC指令发送失败: {e}")
 
     def close(self) -> None:
         """关闭 UDP sockets"""
@@ -710,7 +708,7 @@ class AudioPlayer:
     def interrupt(self) -> None:
         """打断播放"""
         self._interrupted.set()
-        logger.info("播放已打断")
+        logger.debug("播放已打断")
 
     def resume(self) -> None:
         """恢复播放"""
@@ -760,7 +758,7 @@ class RealtimeAudioPlaySession:
 
         self._running = True
         self._task = asyncio.create_task(self._run())
-        logger.info("音频播放会话已启动")
+        logger.debug("音频播放会话已启动")
 
     async def stop(self) -> None:
         """停止播放会话"""
@@ -775,7 +773,7 @@ class RealtimeAudioPlaySession:
                 pass
 
         self.player.close()
-        logger.info("音频播放会话已停止")
+        logger.debug("音频播放会话已停止")
 
     def interrupt(self) -> None:
         """打断播放"""

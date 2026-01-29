@@ -181,13 +181,42 @@ class VoiceDialogSystem:
             asyncio.create_task(self._asr_loop()),
         ]
 
-        logger.info("系统启动完成！")
-        logger.info(f"当前模型: {self.config.llm.model}")
-        logger.info(f"TTS发音人: {self.config.tts.vcn} (武汉话)")
-        logger.info(f"回声消除: {'启用' if self.config.audio.enable_aec else '禁用'}")
-        logger.info(f"打断功能: {'启用' if self.config.enable_barge_in else '禁用'}")
         logger.info("-" * 50)
-        logger.info("请开始说话...")
+        logger.info(f"模型: {self.config.llm.model} | TTS: {self.config.tts.vcn}")
+        logger.info(
+            f"回声消除: {'ON' if self.config.audio.enable_aec else 'OFF'} | 打断: {'ON' if self.config.enable_barge_in else 'OFF'}"
+        )
+        logger.info(
+            f"关键词检测: {'ON' if self.config.enable_keyword_detection else 'OFF'}"
+        )
+        logger.info(f"输出模式: {self.config.audio.output_mode}")
+        logger.info("-" * 50)
+
+        # 播放启动欢迎语
+        if self.config.welcome_message:
+            await self._play_welcome_message()
+
+        logger.info("系统就绪，请开始说话...")
+
+    async def _play_welcome_message(self) -> None:
+        """播放启动欢迎语"""
+        welcome_text = self.config.welcome_message
+        logger.info(f"[欢迎语] 正在合成: {welcome_text}")
+
+        try:
+            # 直接使用 TTS 客户端合成音频并推送到播放队列
+            async for audio_chunk in self.tts_session.client.synthesize(welcome_text):
+                await self.tts_queue.put(audio_chunk)
+
+            # 发送一轮结束标记，触发播放完成回调
+            await self.tts_queue.put(None)
+            logger.info("[欢迎语] 播放完成")
+
+            # 等待一小段时间确保音频播放完毕
+            await asyncio.sleep(0.5)
+
+        except Exception as e:
+            logger.error(f"[欢迎语] 播放失败: {e}")
 
     async def stop(self) -> None:
         """停止系统"""
@@ -281,8 +310,8 @@ class VoiceDialogSystem:
             await self.dialog_manager.reset()
             return
 
-        logger.info(
-            f"开始ASR识别，原始音频长度: {len(audio_data)} bytes ({self.config.audio.sample_rate}Hz)"
+        logger.debug(
+            f"开始ASR识别，音频: {len(audio_data)} bytes @ {self.config.audio.sample_rate}Hz"
         )
 
         # 重采样：从麦克风采样率转换到ASR期望的采样率
@@ -303,8 +332,8 @@ class VoiceDialogSystem:
                 # 转换回int16并转为bytes
                 audio_data = resampled_array.astype(np.int16).tobytes()
 
-                logger.info(
-                    f"重采样完成: {self.config.audio.sample_rate}Hz -> {self.config.asr.sample_rate}Hz, 新长度: {len(audio_data)} bytes"
+                logger.debug(
+                    f"重采样: {self.config.audio.sample_rate}Hz → {self.config.asr.sample_rate}Hz"
                 )
             except Exception as e:
                 logger.error(f"重采样失败: {e}")
@@ -351,20 +380,20 @@ class VoiceDialogSystem:
 
                     text = resp.get_text()
                     if text:
-                        logger.info(f"ASR中间结果: {text}")
+                        logger.debug(f"ASR中间结果: {text}")
 
                     if resp.is_last_package:
                         final_text = resp.get_text()
                         break
 
                 if final_text:
-                    logger.info(f"ASR最终结果: {final_text}")
+                    logger.info(f"[ASR] 用户: {final_text}")
                     await self.dialog_manager.handle_asr_result(final_text)
 
                     # 发送到LLM
                     await self.asr_queue.put(final_text)
                 else:
-                    logger.info("ASR未识别到有效文本")
+                    logger.debug("ASR未识别到有效文本")
                     await self.dialog_manager.reset()
 
         except Exception as e:
