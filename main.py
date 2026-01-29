@@ -25,7 +25,13 @@ from tts_client import RealtimeTTSSession, TextPreprocessor, TTSClient
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    handlers=[logging.StreamHandler(sys.stdout)],
+    force=True,
 )
+logging.getLogger("websockets").setLevel(logging.WARNING)
+logging.getLogger("rosout").setLevel(logging.WARNING)
+logging.getLogger("rospy").setLevel(logging.WARNING)
+logging.getLogger("rospy.internal").setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
 
 
@@ -179,6 +185,7 @@ class VoiceDialogSystem:
         self._tasks = [
             asyncio.create_task(self._vad_loop()),
             asyncio.create_task(self._asr_loop()),
+            asyncio.create_task(self._heartbeat()),
         ]
 
         logger.info("-" * 50)
@@ -208,7 +215,20 @@ class VoiceDialogSystem:
         try:
             # 直接使用 TTS 客户端合成音频并推送到播放队列
             chunk_count = 0
-            async for audio_chunk in self.tts_session.client.synthesize(welcome_text):
+            agen = self.tts_session.client.synthesize(welcome_text)
+            try:
+                first_chunk = await asyncio.wait_for(agen.__anext__(), timeout=5.0)
+            except asyncio.TimeoutError:
+                logger.error("[欢迎语] TTS 首包超时，已跳过欢迎语")
+                return
+            except StopAsyncIteration:
+                logger.warning("[欢迎语] TTS 未返回音频")
+                return
+
+            await self.tts_queue.put(first_chunk)
+            chunk_count += 1
+
+            async for audio_chunk in agen:
                 await self.tts_queue.put(audio_chunk)
                 chunk_count += 1
 
@@ -218,6 +238,15 @@ class VoiceDialogSystem:
 
         except Exception as e:
             logger.error(f"[欢迎语] 播放失败: {e}")
+
+    async def _heartbeat(self) -> None:
+        """运行心跳日志，便于判断是否卡住"""
+        while self._running:
+            try:
+                await asyncio.sleep(5)
+                logger.info("系统运行中...")
+            except asyncio.CancelledError:
+                break
 
     async def stop(self) -> None:
         """停止系统"""

@@ -28,9 +28,9 @@ class ASRConfig:
     channels: int = 1  # 单声道
 
     # VAD与端点检测配置
-    end_window_size_ms: int = 500  # 静音判停时间（ms），越小越快但可能切句过早
+    end_window_size_ms: int = 300  # 静音判停时间（ms），越小越快但可能切句过早
     vad_silence_threshold: int = 500  # VAD能量阈值
-    max_silence_ms: int = 500  # 最大静音时长（ms）
+    max_silence_ms: int = 250  # 最大静音时长（ms）
     max_record_ms: int = 15000  # 单次最大录音时长（ms）
 
     # 分片配置

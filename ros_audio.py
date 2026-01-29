@@ -5,6 +5,7 @@ ROS1 音频发布模块
 """
 
 import logging
+import sys
 from typing import Optional  # noqa: F401
 
 logger = logging.getLogger(__name__)
@@ -74,6 +75,14 @@ class Ros1SpeakerStream:
         # 如果 ROS 节点尚未初始化，则自动初始化
         if not rospy.core.is_initialized():
             rospy.init_node(node_name, anonymous=True, disable_signals=True)
+            # ROS 初始化会重置 logging，这里强制恢复到控制台输出
+            logging.basicConfig(
+                level=logging.INFO,
+                format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+                handlers=[logging.StreamHandler(sys.stdout)],
+                force=True,
+            )
+            logging.getLogger("rosout").setLevel(logging.WARNING)
 
         self.topic = topic
         self._use_audio_msg = _HAS_AUDIO_DATA_MSG
