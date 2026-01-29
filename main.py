@@ -14,7 +14,7 @@ from typing import Optional
 import numpy as np
 from scipy import signal as scipy_signal
 
-from asr_client import ASRClient, ASRResponse
+from asr_client import ASRClient, ASRResponse, get_asr_keyword_detector
 from audio_manager import AudioCapture, AudioPlayer, RealtimeAudioPlaySession, SimpleVAD
 from config import SystemConfig, get_config
 from conversation import DialogEvent, DialogManager, DialogState, create_dialog_queues
@@ -54,6 +54,7 @@ class VoiceDialogSystem:
         # 对话管理
         self.dialog_manager = DialogManager(self.config)
         self.vad = SimpleVAD(threshold=self.config.asr.vad_silence_threshold)
+        self._asr_kw_detector = get_asr_keyword_detector()
 
         # 组件（延迟初始化）
         self.audio_capture: Optional[AudioCapture] = None
@@ -419,6 +420,9 @@ class VoiceDialogSystem:
                 if final_text:
                     logger.info(f"[ASR] 用户: {final_text}")
                     await self.dialog_manager.handle_asr_result(final_text)
+
+                    # ASR关键词检测（触发UDP动作）
+                    self._asr_kw_detector.detect_and_emit(final_text)
 
                     # 发送到LLM
                     await self.asr_queue.put(final_text)
