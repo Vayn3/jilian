@@ -192,28 +192,29 @@ class VoiceDialogSystem:
         logger.info(f"输出模式: {self.config.audio.output_mode}")
         logger.info("-" * 50)
 
-        # 播放启动欢迎语
+        # 播放启动欢迎语（非阻塞方式）
         if self.config.welcome_message:
-            await self._play_welcome_message()
+            asyncio.create_task(self._play_welcome_message())
+            # 给欢迎语一点时间开始播放
+            await asyncio.sleep(0.1)
 
         logger.info("系统就绪，请开始说话...")
 
     async def _play_welcome_message(self) -> None:
         """播放启动欢迎语"""
         welcome_text = self.config.welcome_message
-        logger.info(f"[欢迎语] 正在合成: {welcome_text}")
+        logger.info(f"[欢迎语] 开始合成: {welcome_text}")
 
         try:
             # 直接使用 TTS 客户端合成音频并推送到播放队列
+            chunk_count = 0
             async for audio_chunk in self.tts_session.client.synthesize(welcome_text):
                 await self.tts_queue.put(audio_chunk)
+                chunk_count += 1
 
             # 发送一轮结束标记，触发播放完成回调
             await self.tts_queue.put(None)
-            logger.info("[欢迎语] 播放完成")
-
-            # 等待一小段时间确保音频播放完毕
-            await asyncio.sleep(0.5)
+            logger.info(f"[欢迎语] 合成完成，共 {chunk_count} 个音频块")
 
         except Exception as e:
             logger.error(f"[欢迎语] 播放失败: {e}")

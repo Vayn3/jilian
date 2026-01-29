@@ -67,11 +67,23 @@ pip install PyAudio‑0.2.11‑cp39‑cp39‑win_amd64.whl
 
 ## 使用
 
+### 启动方式
+
+**方式一：本地播放模式（PyAudio）**
 ```bash
 python main.py
 ```
 
-常用参数：
+**方式二：ROS 模式（推荐用于机器人）**
+```bash
+./run_with_ros.sh
+```
+
+> **两种启动方式的区别**：
+> - `python main.py`：直接运行，不加载 ROS 环境。如果 `output_mode=ros1`，会因找不到 `rospy` 自动回退到本地 PyAudio 播放。
+> - `./run_with_ros.sh`：先加载 ROS 环境（`source /opt/ros/noetic/setup.bash`），再运行程序。**使用 ROS 模式必须用此脚本启动**。
+
+### 常用参数
 
 ```bash
 # 列出音频设备
