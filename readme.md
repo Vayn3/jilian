@@ -10,6 +10,9 @@
 - 新增 **双播放模式**：`AudioConfig.output_mode` 支持 `pyaudio`（本地声卡）和 `ros1`（ROS 扬声器话题发布）。
 - 增加 **UDP 动作控制**：ASR/LLM 关键词触发 UDP 指令（默认 5557 端口）并在播放结束自动发送麦克风接管指令（默认 5558 端口）。
 - 支持 **关键词检测** 配置：关键词与正则在 `audio_constants.py` 中集中管理，可开关 `SystemConfig.enable_keyword_detection`。
+- 新增 **LLM 文本流 ROS 发布**：`/dialog/llm_stream` 按 `chunk + 句终` 推送 JSON 文本事件。
+- 新增 **对话日志落盘**：用户与机器人文本追加写入 `dialog.txt`（不覆盖、每条换行、带 `USER:`/`BOT:` 前缀）。
+- 新增 **接收端示例**：`ros_stream_subscriber_demo.py` 可同时订阅音频流与文本流。
 
 ## 系统架构
 
@@ -44,6 +47,9 @@ jilian/
 ├── audio_manager.py  # 音频采集/播放/回声消除/ROS 发布
 ├── audio_constants.py# 采样/音量/关键词配置
 ├── ros_audio.py      # ROS 扬声器发布器（含预热机制）
+├── ros_dialog.py     # ROS 文本流发布器（std_msgs/String + JSON）
+├── dialog_logger.py  # dialog.txt 异步追加写入
+├── ros_stream_subscriber_demo.py # ROS接收端测试脚本
 ├── conversation.py   # 对话管理/状态机/打断处理
 └── requirements.txt  # 依赖
 ```
@@ -144,9 +150,35 @@ welcome_message: str = "大家好，我是华科机器人小科，很高兴见�
 
 ## ROS 扬声器模式
 
-- 设置 `output_mode=ros1` 后，播放将发布到 `AudioConfig.ros_topic_name`。
+- 设置 `output_mode=ros1` 后，播放将发布到 `AudioConfig.ros1_topic`。
 - 需要 ROS1 环境与 `rospy`，主题类型优先使用 `audio_msgs/AudioData`，缺失时使用 `std_msgs/ByteMultiArray`。
 - 若 ROS 不可用，播放自动回落到本地 `pyaudio`。
+
+### LLM 文本流（新增）
+
+- 文本 topic：`/dialog/llm_stream`（`AudioConfig.ros1_llm_text_topic`）
+- 消息类型：`std_msgs/String`
+- 消息内容：JSON
+
+```json
+{"seq":0,"utterance_id":1,"is_final":false,"text":"你好","timestamp":1760000000.1}
+```
+
+说明：
+- `is_final=false`：流式 chunk
+- `is_final=true`：句终文本（供订阅端确定一句结束）
+- 音频 topic 仍保持原有 `/audio`，不新增音频 topic
+
+### 接收端测试
+
+```bash
+source /opt/ros/noetic/setup.bash
+python ros_stream_subscriber_demo.py \
+    --audio-topic /audio \
+    --text-topic /dialog/llm_stream \
+    --sample-rate 24000 \
+    --sample-format f32le
+```
 
 ## RAG 集成（可选）
 

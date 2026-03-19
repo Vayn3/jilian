@@ -392,13 +392,27 @@ class RealtimeLLMSession:
         output_queue: asyncio.Queue,
         config: Optional[LLMConfig] = None,
         rag: Optional[RAGInterface] = None,
+        on_stream_text: Optional[Callable[[str, bool], Any]] = None,
     ):
         self.input_queue = input_queue
         self.output_queue = output_queue
         self.client = LLMClient(config, rag)
         self.splitter = SentenceSplitter()
+        self._on_stream_text = on_stream_text
         self._running = False
         self._task: Optional[asyncio.Task] = None
+
+    async def _emit_stream_text(self, text: str, is_final: bool) -> None:
+        """发出流式文本事件（chunk 或 句终）"""
+        if not self._on_stream_text:
+            return
+
+        try:
+            res = self._on_stream_text(text, is_final)
+            if asyncio.iscoroutine(res):
+                await res
+        except Exception as e:
+            logger.warning("LLM流式文本回调出错: %s", e)
 
     async def start(self) -> None:
         """启动LLM会话"""
@@ -450,16 +464,20 @@ class RealtimeLLMSession:
                 # 流式生成回复
                 use_rag = get_config().rag.enabled
                 async for chunk in self.client.chat_stream(user_text, use_rag):
+                    await self._emit_stream_text(chunk, False)
+
                     # 按句子切分
                     sentences = self.splitter.feed(chunk)
                     for sentence in sentences:
                         await self.output_queue.put(sentence)
+                        await self._emit_stream_text(sentence, True)
                         logger.info(f"[LLM] 机器人: {sentence}")
 
                 # 处理剩余文本
                 remaining = self.splitter.flush()
                 if remaining:
                     await self.output_queue.put(remaining)
+                    await self._emit_stream_text(remaining, True)
                     logger.info(f"[LLM] 机器人: {remaining}")
 
                 # 发送结束标记

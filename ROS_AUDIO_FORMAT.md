@@ -17,6 +17,39 @@
 - **位深度**: 可能是 s16le (int16) 或 f32le (float32)
 - **声道数**: 通常是 1 (单声道)
 
+## 流式发布现状（当前实现）
+
+### 1) 音频流（沿用原有节点，不新增音频 topic）
+- **topic**: `/audio`（由 `AudioConfig.ros1_topic` 配置）
+- **消息类型**:
+    - 优先 `audio_common_msgs/AudioData`
+    - 兜底 `std_msgs/ByteMultiArray`
+- **发布粒度**: 1 条 ROS 消息 = 1 个 TTS 音频 chunk（流式逐块发布）
+
+### 2) 文本流（新增，供并行订阅）
+- **topic**: `/dialog/llm_stream`（由 `AudioConfig.ros1_llm_text_topic` 配置）
+- **消息类型**: `std_msgs/String`
+- **内容格式**: JSON 字符串
+
+```json
+{
+    "seq": 12,
+    "utterance_id": 3,
+    "is_final": false,
+    "text": "今天",
+    "timestamp": 1760000000.123
+}
+```
+
+字段说明：
+- `seq`: 全局递增序号
+- `utterance_id`: 当前机器人回复轮次编号
+- `is_final`: `false` 表示 chunk，`true` 表示句终文本
+- `text`: 文本片段
+- `timestamp`: 秒级时间戳（float）
+
+> 说明：按你的要求，音频仍走原有 `/audio`，不新增音频元信息 topic。
+
 ## 配置方法
 
 在 `config.py` 中的 `AudioConfig` 类添加了两个新参数：
@@ -91,6 +124,9 @@ aplay -l
 ```bash
 source /opt/ros/noetic/setup.bash
 rostopic echo /audio
+
+# 文本流（LLM chunk + 句终）
+rostopic echo /dialog/llm_stream
 ```
 
 ### 3. 测试音频
@@ -149,6 +185,32 @@ ros1_output_format: str = "f32le"
 ### 问题: 音频有杂音/爆音
 **原因**: 数据格式不匹配
 **解决方案**: 检查并调整 `ros1_output_format` 参数
+
+### 问题: 接收端能订阅但播放异常
+**原因**: 接收端解码参数与发送端不一致
+**解决方案**:
+1. 保证接收端使用与发送端一致的采样率/格式（例如 `24000 + f32le + mono`）
+2. 保证接收端订阅的消息类型与发送端一致（`AudioData` 或 `ByteMultiArray`）
+
+## 接收端样例
+
+新增测试脚本：`ros_stream_subscriber_demo.py`
+
+功能：
+- 订阅 `/audio` 并实时播放（可听见即可）
+- 订阅 `/dialog/llm_stream` 并打印 LLM 文本流（chunk + 句终）
+
+示例：
+
+```bash
+source /opt/ros/noetic/setup.bash
+python ros_stream_subscriber_demo.py \
+    --audio-topic /audio \
+    --text-topic /dialog/llm_stream \
+    --sample-rate 24000 \
+    --sample-format f32le \
+    --audio-msg-type audio_data
+```
 
 ## 日志查看
 

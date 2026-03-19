@@ -18,7 +18,10 @@ from asr_client import ASRClient, ASRResponse, get_asr_keyword_detector
 from audio_manager import AudioCapture, AudioPlayer, RealtimeAudioPlaySession, SimpleVAD
 from config import SystemConfig, get_config
 from conversation import DialogEvent, DialogManager, DialogState, create_dialog_queues
+from dialog_logger import DialogFileLogger
 from llm_client import LLMClient, RAGInterface, RealtimeLLMSession, SimpleRAG
+from ros_dialog import Ros1DialogTextPublisher
+from ros_dialog import is_ros_available as is_ros_dialog_available
 from tts_client import RealtimeTTSSession, TextPreprocessor, TTSClient
 
 # 配置日志
@@ -62,6 +65,8 @@ class VoiceDialogSystem:
         self.asr_client: Optional[ASRClient] = None
         self.llm_session: Optional[RealtimeLLMSession] = None
         self.tts_session: Optional[RealtimeTTSSession] = None
+        self.dialog_logger: Optional[DialogFileLogger] = None
+        self.dialog_text_pub: Optional[Ros1DialogTextPublisher] = None
 
         # RAG（可选）
         self.rag: Optional[RAGInterface] = None
@@ -105,6 +110,24 @@ class VoiceDialogSystem:
         """初始化组件"""
         loop = asyncio.get_running_loop()
 
+        # 对话文本落盘（追加写入，不覆盖）
+        self.dialog_logger = DialogFileLogger(file_path="dialog.txt")
+
+        # ROS 文本流发布器（不影响原有音频发布链路）
+        if (
+            self.config.audio.output_mode.lower() == "ros1"
+            and is_ros_dialog_available()
+        ):
+            try:
+                self.dialog_text_pub = Ros1DialogTextPublisher(
+                    topic=self.config.audio.ros1_llm_text_topic,
+                    node_name=self.config.audio.ros1_node_name,
+                    queue_size=self.config.audio.ros1_llm_text_queue_size,
+                )
+            except Exception as e:
+                self.dialog_text_pub = None
+                logger.warning("ROS文本流发布器初始化失败: %s", e)
+
         # 音频采集（带回声消除）
         self.audio_capture = AudioCapture(
             output_queue=self.audio_queue,
@@ -132,6 +155,7 @@ class VoiceDialogSystem:
             output_queue=self.llm_queue,
             config=self.config.llm,
             rag=self.rag,
+            on_stream_text=self._on_llm_stream_text,
         )
 
         # TTS会话
@@ -162,6 +186,15 @@ class VoiceDialogSystem:
         """TTS结束时回到IDLE"""
         await self.dialog_manager.handle_tts_end()
 
+    async def _on_llm_stream_text(self, text: str, is_final: bool) -> None:
+        """LLM流式文本事件：发布到ROS，并将句终文本写入 dialog.txt"""
+        if self.dialog_text_pub:
+            self.dialog_text_pub.publish_text(text, is_final)
+
+        # 句终写入，降低I/O开销；满足每次写入换行与说话人前缀
+        if is_final and text and self.dialog_logger:
+            await self.dialog_logger.log_line("BOT", text)
+
     async def start(self) -> None:
         """启动系统"""
         if self._running:
@@ -173,6 +206,10 @@ class VoiceDialogSystem:
 
         self._running = True
         self._init_components()
+
+        # 启动对话落盘后台任务
+        if self.dialog_logger:
+            await self.dialog_logger.start()
 
         # 启动音频采集
         self.audio_capture.start()
@@ -276,6 +313,10 @@ class VoiceDialogSystem:
             await self.tts_session.stop()
         if self.asr_client:
             await self.asr_client.close()
+        if self.dialog_logger:
+            await self.dialog_logger.stop()
+        if self.dialog_text_pub:
+            self.dialog_text_pub.close()
 
         logger.info("系统已停止")
 
@@ -420,6 +461,14 @@ class VoiceDialogSystem:
                 if final_text:
                     logger.info(f"[ASR] 用户: {final_text}")
                     await self.dialog_manager.handle_asr_result(final_text)
+
+                    # 记录用户文本（追加写入，不覆盖）
+                    if self.dialog_logger:
+                        await self.dialog_logger.log_line("USER", final_text)
+
+                    # 标记新一轮机器人输出（用于ROS文本流分轮）
+                    if self.dialog_text_pub:
+                        self.dialog_text_pub.start_new_utterance()
 
                     # ASR关键词检测（触发UDP动作）
                     self._asr_kw_detector.detect_and_emit(final_text)
