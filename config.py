@@ -29,7 +29,7 @@ class ASRConfig:
 
     # VAD与端点检测配置
     end_window_size_ms: int = 200  # 静音判停时间（ms），越小越快但可能切句过早
-    vad_silence_threshold: int = 500  # VAD能量阈值
+    vad_silence_threshold: int = 400  # VAD能量阈值
     max_silence_ms: int = 200  # 最大静音时长（ms）
     max_record_ms: int = 15000  # 单次最大录音时长（ms）
 
@@ -214,7 +214,7 @@ class TTSConfig:
     vcn: str = "x4_yezi"  # "x2_xiaowang"  # 武汉话发音人
 
     # 语音参数
-    speed: int = 60  # 语速 0-100，50为正常
+    speed: int = 50  # 语速 0-100，50为正常
     volume: int = 50  # 音量 0-100
     pitch: int = 50  # 音高 0-100
 
