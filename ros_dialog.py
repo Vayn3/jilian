@@ -27,7 +27,7 @@ class Ros1DialogTextPublisher:
 
     def __init__(
         self,
-        topic: str = "/dialog/llm_stream",
+        topic: str = "/hri/dialog/llm_stream",
         node_name: str = "dialog_text_publisher",
         queue_size: int = 50,
     ):

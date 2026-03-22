@@ -7,12 +7,15 @@
 ## 音频格式参数
 
 ### TTS输出格式（默认）
+
 - **采样率**: 16000 Hz (16kHz)
 - **位深度**: 16 bit (s16le, 即 signed 16-bit little-endian)
 - **声道数**: 1 (单声道)
 
 ### 下位机播放格式（需配置）
+
 根据您的下位机配置进行设置：
+
 - **采样率**: 可能是 16kHz, 24kHz, 或其他
 - **位深度**: 可能是 s16le (int16) 或 f32le (float32)
 - **声道数**: 通常是 1 (单声道)
@@ -20,28 +23,31 @@
 ## 流式发布现状（当前实现）
 
 ### 1) 音频流（沿用原有节点，不新增音频 topic）
+
 - **topic**: `/audio`（由 `AudioConfig.ros1_topic` 配置）
 - **消息类型**:
-    - 优先 `audio_common_msgs/AudioData`
-    - 兜底 `std_msgs/ByteMultiArray`
+  - 优先 `audio_common_msgs/AudioData`
+  - 兜底 `std_msgs/ByteMultiArray`
 - **发布粒度**: 1 条 ROS 消息 = 1 个 TTS 音频 chunk（流式逐块发布）
 
 ### 2) 文本流（新增，供并行订阅）
-- **topic**: `/dialog/llm_stream`（由 `AudioConfig.ros1_llm_text_topic` 配置）
+
+- **topic**: `/hri/dialog/llm_stream`（由 `AudioConfig.ros1_llm_text_topic` 配置）
 - **消息类型**: `std_msgs/String`
 - **内容格式**: JSON 字符串
 
 ```json
 {
-    "seq": 12,
-    "utterance_id": 3,
-    "is_final": false,
-    "text": "今天",
-    "timestamp": 1760000000.123
+  "seq": 12,
+  "utterance_id": 3,
+  "is_final": false,
+  "text": "今天",
+  "timestamp": 1760000000.123
 }
 ```
 
 字段说明：
+
 - `seq`: 全局递增序号
 - `utterance_id`: 当前机器人回复轮次编号
 - `is_final`: `false` 表示 chunk，`true` 表示句终文本
@@ -77,16 +83,16 @@ ros1_output_format: str = "f32le"     # 下位机期望的格式
 @dataclass
 class AudioConfig:
     # ... 其他配置 ...
-    
+
     # 输出模式
     output_mode: str = "ros1"
-    
+
     # ROS1 扬声器发布配置
     ros1_topic: str = "/audio"
     ros1_node_name: str = "speaker_publisher"
     ros1_queue_size: int = 10
     ros1_latch: bool = False
-    
+
     # ROS1 音频格式转换配置
     ros1_output_sample_rate: int = 24000  # 匹配下位机24kHz
     ros1_output_format: str = "f32le"     # 匹配下位机float32格式
@@ -113,6 +119,7 @@ TTS输出 (16kHz, int16)
 ### 1. 检查下位机音频参数
 
 在下位机上查看播放参数：
+
 ```bash
 # 查看aplay或播放器配置
 aplay -l
@@ -126,7 +133,7 @@ source /opt/ros/noetic/setup.bash
 rostopic echo /audio
 
 # 文本流（LLM chunk + 句终）
-rostopic echo /dialog/llm_stream
+rostopic echo /hri/dialog/llm_stream
 ```
 
 ### 3. 测试音频
@@ -136,24 +143,28 @@ rostopic echo /dialog/llm_stream
 ## 常见配置组合
 
 ### 配置1: 16kHz + int16 (无需转换)
+
 ```python
 ros1_output_sample_rate: int = 16000
 ros1_output_format: str = "s16le"
 ```
 
 ### 配置2: 24kHz + int16
+
 ```python
 ros1_output_sample_rate: int = 24000
 ros1_output_format: str = "s16le"
 ```
 
 ### 配置3: 24kHz + float32 (当前配置)
+
 ```python
 ros1_output_sample_rate: int = 24000
 ros1_output_format: str = "f32le"
 ```
 
 ### 配置4: 48kHz + float32
+
 ```python
 ros1_output_sample_rate: int = 48000
 ros1_output_format: str = "f32le"
@@ -169,7 +180,9 @@ ros1_output_format: str = "f32le"
 ## 故障排除
 
 ### 问题: 音频仍然乱码
+
 **解决方案**:
+
 1. 确认下位机的实际播放参数
 2. 检查 `config.py` 中的 `ros1_output_sample_rate` 和 `ros1_output_format` 是否匹配
 3. 查看系统日志中的格式转换信息：
@@ -179,16 +192,20 @@ ros1_output_format: str = "f32le"
    ```
 
 ### 问题: 播放速度异常（太快或太慢）
+
 **原因**: 采样率不匹配
 **解决方案**: 调整 `ros1_output_sample_rate` 参数
 
 ### 问题: 音频有杂音/爆音
+
 **原因**: 数据格式不匹配
 **解决方案**: 检查并调整 `ros1_output_format` 参数
 
 ### 问题: 接收端能订阅但播放异常
+
 **原因**: 接收端解码参数与发送端不一致
 **解决方案**:
+
 1. 保证接收端使用与发送端一致的采样率/格式（例如 `24000 + f32le + mono`）
 2. 保证接收端订阅的消息类型与发送端一致（`AudioData` 或 `ByteMultiArray`）
 
@@ -197,8 +214,9 @@ ros1_output_format: str = "f32le"
 新增测试脚本：`ros_stream_subscriber_demo.py`
 
 功能：
+
 - 订阅 `/audio` 并实时播放（可听见即可）
-- 订阅 `/dialog/llm_stream` 并打印 LLM 文本流（chunk + 句终）
+- 订阅 `/hri/dialog/llm_stream` 并打印 LLM 文本流（chunk + 句终）
 
 示例：
 
@@ -206,7 +224,7 @@ ros1_output_format: str = "f32le"
 source /opt/ros/noetic/setup.bash
 python ros_stream_subscriber_demo.py \
     --audio-topic /audio \
-    --text-topic /dialog/llm_stream \
+    --text-topic /hri/dialog/llm_stream \
     --sample-rate 24000 \
     --sample-format f32le \
     --audio-msg-type audio_data
@@ -215,12 +233,14 @@ python ros_stream_subscriber_demo.py \
 ## 日志查看
 
 启动系统时会输出格式转换日志：
+
 ```
 2026-01-26 18:19:03,351 - audio_manager - DEBUG - 音频重采样: 16000Hz -> 24000Hz
 2026-01-26 18:19:03,351 - audio_manager - DEBUG - 音频格式转换: int16 -> float32
 ```
 
 如果看不到这些日志，可以在 `config.py` 中调整日志级别：
+
 ```python
 log_level: str = "DEBUG"  # 改为DEBUG以查看详细日志
 ```

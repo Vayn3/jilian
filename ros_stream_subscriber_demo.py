@@ -3,7 +3,7 @@
 """
 ROS 流式接收端示例
 - 订阅音频 topic（默认 /audio）并实时播放
-- 订阅 LLM 文本流 topic（默认 /dialog/llm_stream）并打印
+- 订阅 LLM 文本流 topic（默认 /hri/dialog/llm_stream）并打印
 
 说明：
 1) 为兼容你当前发送端，音频消息类型支持两种：
@@ -301,7 +301,7 @@ class StreamSubscriber:
 def main() -> None:
     parser = argparse.ArgumentParser(description="ROS 流式接收端示例")
     parser.add_argument("--audio-topic", default="/audio")
-    parser.add_argument("--text-topic", default="/dialog/llm_stream")
+    parser.add_argument("--text-topic", default="/hri/dialog/llm_stream")
     parser.add_argument("--sample-rate", type=int, default=24000)
     parser.add_argument("--sample-format", choices=["s16le", "f32le"], default="f32le")
     parser.add_argument("--channels", type=int, default=1)

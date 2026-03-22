@@ -263,7 +263,7 @@ class AudioConfig:
     ros1_latch: bool = False  # 是否使用 latched 模式
 
     # ROS1 LLM 文本流发布配置
-    ros1_llm_text_topic: str = "/dialog/llm_stream"
+    ros1_llm_text_topic: str = "/hri/dialog/llm_stream"
     ros1_llm_text_queue_size: int = 50
 
     # ROS1 音频格式转换配置（用于匹配下位机播放格式）

@@ -10,7 +10,7 @@
 - 新增 **双播放模式**：`AudioConfig.output_mode` 支持 `pyaudio`（本地声卡）和 `ros1`（ROS 扬声器话题发布）。
 - 增加 **UDP 动作控制**：ASR/LLM 关键词触发 UDP 指令（默认 5557 端口）并在播放结束自动发送麦克风接管指令（默认 5558 端口）。
 - 支持 **关键词检测** 配置：关键词与正则在 `audio_constants.py` 中集中管理，可开关 `SystemConfig.enable_keyword_detection`。
-- 新增 **LLM 文本流 ROS 发布**：`/dialog/llm_stream` 按 `chunk + 句终` 推送 JSON 文本事件。
+- 新增 **LLM 文本流 ROS 发布**：`/hri/dialog/llm_stream` 按 `chunk + 句终` 推送 JSON 文本事件。
 - 新增 **对话日志落盘**：用户与机器人文本追加写入 `dialog.txt`（不覆盖、每条换行、带 `USER:`/`BOT:` 前缀）。
 - 新增 **接收端示例**：`ros_stream_subscriber_demo.py` 可同时订阅音频流与文本流。
 
@@ -76,16 +76,19 @@ pip install PyAudio‑0.2.11‑cp39‑cp39‑win_amd64.whl
 ### 启动方式
 
 **方式一：本地播放模式（PyAudio）**
+
 ```bash
 python main.py
 ```
 
 **方式二：ROS 模式（推荐用于机器人）**
+
 ```bash
 ./run_with_ros.sh
 ```
 
 > **两种启动方式的区别**：
+>
 > - `python main.py`：直接运行，不加载 ROS 环境。如果 `output_mode=ros1`，会因找不到 `rospy` 自动回退到本地 PyAudio 播放。
 > - `./run_with_ros.sh`：先加载 ROS 环境（`source /opt/ros/noetic/setup.bash`），再运行程序。**使用 ROS 模式必须用此脚本启动**。
 
@@ -156,15 +159,22 @@ welcome_message: str = "大家好，我是华科机器人小科，很高兴见�
 
 ### LLM 文本流（新增）
 
-- 文本 topic：`/dialog/llm_stream`（`AudioConfig.ros1_llm_text_topic`）
+- 文本 topic：`/hri/dialog/llm_stream`（`AudioConfig.ros1_llm_text_topic`）
 - 消息类型：`std_msgs/String`
 - 消息内容：JSON
 
 ```json
-{"seq":0,"utterance_id":1,"is_final":false,"text":"你好","timestamp":1760000000.1}
+{
+  "seq": 0,
+  "utterance_id": 1,
+  "is_final": false,
+  "text": "你好",
+  "timestamp": 1760000000.1
+}
 ```
 
 说明：
+
 - `is_final=false`：流式 chunk
 - `is_final=true`：句终文本（供订阅端确定一句结束）
 - 音频 topic 仍保持原有 `/audio`，不新增音频 topic
@@ -175,7 +185,7 @@ welcome_message: str = "大家好，我是华科机器人小科，很高兴见�
 source /opt/ros/noetic/setup.bash
 python ros_stream_subscriber_demo.py \
     --audio-topic /audio \
-    --text-topic /dialog/llm_stream \
+    --text-topic /hri/dialog/llm_stream \
     --sample-rate 24000 \
     --sample-format f32le
 ```
