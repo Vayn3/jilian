@@ -7,6 +7,7 @@
 - 新增 **启动欢迎语**：系统启动时自动播放配置的欢迎语，可在 `config.py` 中设置 `SystemConfig.welcome_message`。
 - 优化 **ROS 音频发布**：解决首帧丢失问题，发布者创建后自动预热（等待订阅者连接+发送静音帧）。
 - 优化 **命令行日志输出**：精简日志，关键信息更清晰，关键词检测会详细打印匹配词和动作。
+- 新增 **输入模式配置**：`AudioConfig.input_mode` 支持 `ros1`（默认，订阅 ROS 音频输入）和 `pyaudio`（本地麦克风直采），并支持 `ros1_input_topic` 配置输入话题。
 - 新增 **双播放模式**：`AudioConfig.output_mode` 支持 `pyaudio`（本地声卡）和 `ros1`（ROS 扬声器话题发布）。
 - 增加 **UDP 动作控制**：ASR/LLM 关键词触发 UDP 指令（默认 5557 端口）并在播放结束自动发送麦克风接管指令（默认 5558 端口）。
 - 支持 **关键词检测** 配置：关键词与正则在 `audio_constants.py` 中集中管理，可开关 `SystemConfig.enable_keyword_detection`。
@@ -89,8 +90,8 @@ python main.py
 
 > **两种启动方式的区别**：
 >
-> - `python main.py`：直接运行，不加载 ROS 环境。如果 `output_mode=ros1`，会因找不到 `rospy` 自动回退到本地 PyAudio 播放。
-> - `./run_with_ros.sh`：先加载 ROS 环境（`source /opt/ros/noetic/setup.bash`），再运行程序。**使用 ROS 模式必须用此脚本启动**。
+> - `python main.py`：直接运行，不加载 ROS 环境。若 `input_mode=ros1` 且当前环境没有 `rospy`，程序会报错并提示切换 `input_mode=pyaudio`。
+> - `./run_with_ros.sh`：先加载 ROS 环境（`source /opt/ros/noetic/setup.bash`），再运行程序。默认输入模式为 `ros1`，建议 ROS 场景使用此脚本启动。
 
 ### 常用参数
 
@@ -127,7 +128,9 @@ welcome_message: str = "大家好，我是华科机器人小科，很高兴见�
 
 ### 其他配置
 
-- `AudioConfig.output_mode`: `pyaudio`（默认）或 `ros1`。选择 `ros1` 时需已启动 ROS1 并有 `audio_msgs/AudioData` 消息，未找到 ROS 会自动回退到 `pyaudio`。
+- `AudioConfig.input_mode`: `ros1`（默认）或 `pyaudio`。`ros1` 时订阅 `AudioConfig.ros1_input_topic`（默认 `/audio/audio`）作为麦克风输入。
+- `AudioConfig.ros1_input_sample_rate` / `ros1_input_channels`: 指定 ROS 输入流的采样率与声道数，用于输入归一化。
+- `AudioConfig.output_mode`: `pyaudio` 或 `ros1`，用于控制输出播放路径。
 - `AudioConfig.ros1_topic` / `ros1_node_name` / `ros1_queue_size`: ROS 发布主题与队列。
 - `SystemConfig.voice_udp_host` / `voice_udp_port`(默认 5557) / `mic_udp_port`(默认 5558): UDP 指令目标。
 - `SystemConfig.enable_keyword_detection`: 控制 ASR/LLM 关键词触发。

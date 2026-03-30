@@ -279,6 +279,17 @@ class AudioConfig:
     enable_agc: bool = True  # 启用自动增益
     agc_target_level: int = 3  # AGC目标电平 0-31
 
+    # ========== 输入模式配置 ==========
+    # 输入模式: "ros1" = 订阅ROS麦克风话题, "pyaudio" = 本地麦克风采集
+    input_mode: str = "ros1"
+
+    # ROS1 麦克风输入配置（仅当 input_mode="ros1" 时生效）
+    ros1_input_topic: str = "/audio/audio"
+    ros1_input_node_name: str = "mic_input_subscriber"
+    ros1_input_queue_size: int = 50
+    ros1_input_sample_rate: int = 48000
+    ros1_input_channels: int = 2
+
     # ========== 播放模式配置 ==========
     # 输出模式: "pyaudio" = 本地扬声器播放, "ros1" = ROS话题发布
     output_mode: str = "ros1"

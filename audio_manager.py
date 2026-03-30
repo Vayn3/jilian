@@ -23,6 +23,25 @@ from scipy import signal as scipy_signal
 from config import AudioConfig, get_config
 from ros_audio import Ros1SpeakerStream, is_ros_available
 
+try:
+    import rospy
+    from std_msgs.msg import ByteMultiArray
+
+    try:
+        from audio_common_msgs.msg import AudioData as RosAudioData
+
+        _HAS_ROS_AUDIO_DATA = True
+    except Exception:
+        RosAudioData = None
+        _HAS_ROS_AUDIO_DATA = False
+    _HAS_ROS1 = True
+except Exception:
+    rospy = None
+    ByteMultiArray = None
+    RosAudioData = None
+    _HAS_ROS1 = False
+    _HAS_ROS_AUDIO_DATA = False
+
 logger = logging.getLogger(__name__)
 
 
@@ -288,6 +307,12 @@ class AudioCapture:
         self.stream: Optional[pyaudio.Stream] = None
         self._running = False
         self._thread: Optional[threading.Thread] = None
+        self._input_mode = (self.config.input_mode or "pyaudio").lower()
+
+        # ROS 输入状态
+        self._ros_audio_sub = None
+        self._ros_msg_type = ""
+        self._ros_ratecv_state = None
 
         # 音频处理组件
         self.aec: Optional[SimpleAEC] = None
@@ -303,6 +328,125 @@ class AudioCapture:
             self.ns = SimpleNoiseSupressor(
                 sample_rate=self.config.sample_rate,
             )
+
+    def _enqueue_audio_frame(self, audio_data: bytes) -> None:
+        """线程安全地将音频帧写入异步队列。"""
+        try:
+            self.loop.call_soon_threadsafe(
+                lambda: self.output_queue.put_nowait(audio_data)
+            )
+        except Exception as e:
+            logger.warning(f"放入队列失败: {e}")
+
+    def _apply_input_processing(self, audio_data: bytes) -> bytes:
+        """对输入音频统一执行 AEC/NS 处理。"""
+        processed_data = audio_data
+
+        if self.aec and self.config.enable_aec:
+            processed_data = self.aec.process(processed_data)
+
+        if self.ns and self.config.enable_ns:
+            processed_data = self.ns.process(processed_data)
+
+        return processed_data
+
+    def _normalize_ros_audio(self, audio_data: bytes) -> bytes:
+        """将 ROS 输入音频归一化到系统配置采样参数。"""
+        normalized = audio_data
+        sample_width = self.config.sample_width
+
+        in_channels = max(1, int(self.config.ros1_input_channels))
+        out_channels = max(1, int(self.config.channels))
+
+        in_rate = max(1, int(self.config.ros1_input_sample_rate))
+        out_rate = max(1, int(self.config.sample_rate))
+
+        if in_channels != out_channels:
+            if in_channels == 2 and out_channels == 1:
+                normalized = audioop.tomono(normalized, sample_width, 0.5, 0.5)
+            elif in_channels == 1 and out_channels == 2:
+                normalized = audioop.tostereo(normalized, sample_width, 1.0, 1.0)
+            else:
+                raise ValueError(
+                    f"不支持的通道转换: {in_channels} -> {out_channels}"
+                )
+
+        if in_rate != out_rate:
+            normalized, self._ros_ratecv_state = audioop.ratecv(
+                normalized,
+                sample_width,
+                out_channels,
+                in_rate,
+                out_rate,
+                self._ros_ratecv_state,
+            )
+
+        return normalized
+
+    def _ros_audio_callback(self, msg) -> None:
+        """ROS 回调：读取音频消息并转入系统输入队列。"""
+        if not self._running:
+            return
+
+        try:
+            audio_data = bytes(msg.data)
+            normalized = self._normalize_ros_audio(audio_data)
+            processed_data = self._apply_input_processing(normalized)
+            self._enqueue_audio_frame(processed_data)
+        except Exception as e:
+            logger.warning(f"ROS输入音频处理失败: {e}")
+
+    def _start_ros_capture(self) -> None:
+        """启动 ROS 订阅式麦克风输入。"""
+        if not _HAS_ROS1:
+            raise RuntimeError(
+                "当前环境不可用 ROS1(rospy)，请安装 ROS1 或将 input_mode 切换为 pyaudio"
+            )
+
+        if not rospy.core.is_initialized():
+            rospy.init_node(
+                self.config.ros1_input_node_name,
+                anonymous=True,
+                disable_signals=True,
+            )
+
+        topic = self.config.ros1_input_topic
+        queue_size = self.config.ros1_input_queue_size
+
+        if _HAS_ROS_AUDIO_DATA:
+            self._ros_audio_sub = rospy.Subscriber(
+                topic,
+                RosAudioData,
+                self._ros_audio_callback,
+                queue_size=queue_size,
+            )
+            self._ros_msg_type = "audio_common_msgs/AudioData"
+        else:
+            self._ros_audio_sub = rospy.Subscriber(
+                topic,
+                ByteMultiArray,
+                self._ros_audio_callback,
+                queue_size=queue_size,
+            )
+            self._ros_msg_type = "std_msgs/ByteMultiArray"
+
+        self._ros_ratecv_state = None
+        logger.info(
+            "ROS输入订阅已启动: %s (%s)",
+            topic,
+            self._ros_msg_type,
+        )
+
+    def _stop_ros_capture(self) -> None:
+        """停止 ROS 输入订阅。"""
+        if self._ros_audio_sub:
+            try:
+                self._ros_audio_sub.unregister()
+            except Exception:
+                pass
+            self._ros_audio_sub = None
+
+        self._ros_ratecv_state = None
 
     def _get_device_info(self) -> dict:
         """获取设备信息"""
@@ -371,23 +515,8 @@ class AudioCapture:
         if not self._running:
             return (None, pyaudio.paComplete)
 
-        processed_data = in_data
-
-        # 回声消除
-        if self.aec and self.config.enable_aec:
-            processed_data = self.aec.process(processed_data)
-
-        # 噪声抑制
-        if self.ns and self.config.enable_ns:
-            processed_data = self.ns.process(processed_data)
-
-        # 放入队列
-        try:
-            self.loop.call_soon_threadsafe(
-                lambda: self.output_queue.put_nowait(processed_data)
-            )
-        except Exception as e:
-            logger.warning(f"放入队列失败: {e}")
+        processed_data = self._apply_input_processing(in_data)
+        self._enqueue_audio_frame(processed_data)
 
         return (None, pyaudio.paContinue)
 
@@ -397,6 +526,19 @@ class AudioCapture:
             return
 
         self._running = True
+
+        if self._input_mode == "ros1":
+            try:
+                self._start_ros_capture()
+                logger.debug("ROS订阅音频采集已启动")
+            except Exception:
+                self._running = False
+                raise
+            return
+
+        if self._input_mode != "pyaudio":
+            self._running = False
+            raise ValueError(f"不支持的 input_mode: {self._input_mode}")
 
         if not self.pa:
             self.pa = pyaudio.PyAudio()
@@ -433,6 +575,9 @@ class AudioCapture:
         """停止采集"""
         self._running = False
 
+        if self._input_mode == "ros1":
+            self._stop_ros_capture()
+
         if self.stream:
             self.stream.stop_stream()
             self.stream.close()
@@ -442,7 +587,7 @@ class AudioCapture:
             self.pa.terminate()
             self.pa = None
 
-        logger.debug("音频采集已停止")
+        logger.debug("音频采集已停止 (%s)", self._input_mode)
 
     def reset_aec(self) -> None:
         """重置回声消除器"""
