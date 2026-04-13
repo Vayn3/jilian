@@ -289,6 +289,7 @@ class AudioConfig:
     ros1_input_queue_size: int = 50
     ros1_input_sample_rate: int = 48000
     ros1_input_channels: int = 2
+    ros1_input_tcp_nodelay: bool = True
 
     # ========== 播放模式配置 ==========
     # 输出模式: "pyaudio" = 本地扬声器播放, "ros1" = ROS话题发布
@@ -296,6 +297,7 @@ class AudioConfig:
 
     # ROS1 扬声器发布配置（仅当 output_mode="ros1" 时生效）
     ros1_topic: str = "/audio"  # ROS 话题名
+    ros1_control_topic: str = "/audio/control"
     ros1_node_name: str = "speaker_publisher"  # ROS 节点名
     ros1_queue_size: int = 10  # 发布队列大小
     ros1_latch: bool = False  # 是否使用 latched 模式
@@ -309,6 +311,7 @@ class AudioConfig:
     ros1_output_format: str = (
         "f32le"  # 下位机期望的格式：f32le (float32) 或 s16le (int16)
     )
+    ros1_audio_frame_ms: int = 20
 
     @property
     def bytes_per_frame(self) -> int:
@@ -362,6 +365,10 @@ class SystemConfig:
     # 打断配置
     enable_barge_in: bool = True  # 启用打断功能
     barge_in_threshold: int = 600  # 打断检测能量阈值
+    duplex_mode: str = "half"
+    barge_in_min_duration_ms: int = 120
+    barge_in_preroll_ms: int = 200
+    barge_in_echo_ratio: float = 1.8
 
     # ========== 启动欢迎语配置 ==========
     # 系统启动时自动播放的欢迎语（设为空字符串则不播放）
@@ -389,6 +396,12 @@ class SystemConfig:
             "tts": self.tts.__dict__,
             "audio": self.audio.__dict__,
             "rag": self.rag.__dict__,
+            "duplex_mode": self.duplex_mode,
+            "enable_barge_in": self.enable_barge_in,
+            "barge_in_threshold": self.barge_in_threshold,
+            "barge_in_min_duration_ms": self.barge_in_min_duration_ms,
+            "barge_in_preroll_ms": self.barge_in_preroll_ms,
+            "barge_in_echo_ratio": self.barge_in_echo_ratio,
         }
 
 

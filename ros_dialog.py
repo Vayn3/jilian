@@ -48,15 +48,14 @@ class Ros1DialogTextPublisher:
         self._pub = rospy.Publisher(topic, String, queue_size=queue_size)
         self._closed = False
         self._seq = 0
-        self._utterance_id = 0
 
         logger.info("[ROS] 文本流发布启用: %s", topic)
 
     def start_new_utterance(self) -> None:
         """开始新一轮机器人回复（可选调用）"""
-        self._utterance_id += 1
+        return
 
-    def publish_text(self, text: str, is_final: bool) -> None:
+    def publish_text(self, text: str, is_final: bool, utterance_id: int) -> None:
         """发布文本事件。
 
         数据格式（JSON 字符串）:
@@ -73,7 +72,7 @@ class Ros1DialogTextPublisher:
 
         payload = {
             "seq": self._seq,
-            "utterance_id": self._utterance_id,
+            "utterance_id": int(utterance_id),
             "is_final": bool(is_final),
             "text": text,
             "timestamp": time.time(),

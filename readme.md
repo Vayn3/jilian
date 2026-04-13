@@ -4,6 +4,9 @@
 
 ## 近期更新
 
+- 新增 **全双工/半双工切换**：通过 `--duplex-mode half|full` 选择启动模式，默认 `half`；`--no-barge-in` 作为兼容别名会强制回到半双工。
+- 新增 **ROS 可中断播放**：全双工模式下会向 `/audio/control` 发送 `stop` 控制消息，下位机收到后会立即清队列并重开扬声器流，避免旧音频继续播完。
+- 新增 **ROS 麦克风输入固定帧处理**：ROS 订阅输入会先归一化再拆成固定 20ms 子帧，尽量把新增延迟控制在几十毫秒量级。
 - 新增 **启动欢迎语**：系统启动时自动播放配置的欢迎语，可在 `config.py` 中设置 `SystemConfig.welcome_message`。
 - 优化 **ROS 音频发布**：解决首帧丢失问题，发布者创建后自动预热（等待订阅者连接+发送静音帧）。
 - 优化 **命令行日志输出**：精简日志，关键信息更清晰，关键词检测会详细打印匹配词和动作。
@@ -76,6 +79,8 @@ pip install PyAudio‑0.2.11‑cp39‑cp39‑win_amd64.whl
 
 ### 启动方式
 
+系统默认以 **半双工** 启动；只有显式指定 `--duplex-mode full` 才启用全双工。两种输入模式都支持同一套切换参数。
+
 **方式一：本地播放模式（PyAudio）**
 
 ```bash
@@ -92,6 +97,8 @@ python main.py
 >
 > - `python main.py`：直接运行，不加载 ROS 环境。若 `input_mode=ros1` 且当前环境没有 `rospy`，程序会报错并提示切换 `input_mode=pyaudio`。
 > - `./run_with_ros.sh`：先加载 ROS 环境（`source /opt/ros/noetic/setup.bash`），再运行程序。默认输入模式为 `ros1`，建议 ROS 场景使用此脚本启动。
+> - `--duplex-mode half|full`：控制是否启用全双工打断逻辑，默认 `half`。
+> - `--no-barge-in`：兼容旧用法，等价于强制半双工。
 
 ### 常用参数
 
@@ -108,7 +115,13 @@ python main.py --model qwen-plus
 # 调整 VAD
 python main.py --vad-threshold 600 --silence-ms 300
 
-# 禁用回声消除/打断
+# 启用全双工，允许用户说话打断机器人播放
+python main.py --duplex-mode full
+
+# 保持半双工，兼容旧行为
+python main.py --duplex-mode half
+
+# 禁用回声消除/强制半双工
 python main.py --no-aec --no-barge-in
 
 # 启用调试日志
@@ -130,8 +143,11 @@ welcome_message: str = "大家好，我是华科机器人小科，很高兴见�
 
 - `AudioConfig.input_mode`: `ros1`（默认）或 `pyaudio`。`ros1` 时订阅 `AudioConfig.ros1_input_topic`（默认 `/audio/audio`）作为麦克风输入。
 - `AudioConfig.ros1_input_sample_rate` / `ros1_input_channels`: 指定 ROS 输入流的采样率与声道数，用于输入归一化。
+- `AudioConfig.ros1_input_tcp_nodelay`: ROS 麦克风输入建议保持 `True`，减少额外排队延迟。
+- `AudioConfig.ros1_audio_frame_ms`: ROS 输入和输出的固定拆帧时长，默认 `20`ms。
 - `AudioConfig.output_mode`: `pyaudio` 或 `ros1`，用于控制输出播放路径。
 - `AudioConfig.ros1_topic` / `ros1_node_name` / `ros1_queue_size`: ROS 发布主题与队列。
+- `AudioConfig.ros1_control_topic`: ROS 停播控制 topic，默认 `/audio/control`。
 - `SystemConfig.voice_udp_host` / `voice_udp_port`(默认 5557) / `mic_udp_port`(默认 5558): UDP 指令目标。
 - `SystemConfig.enable_keyword_detection`: 控制 ASR/LLM 关键词触发。
 - 关键词配置：见 `audio_constants.py`，可调整触发短语。
@@ -159,6 +175,8 @@ welcome_message: str = "大家好，我是华科机器人小科，很高兴见�
 - 设置 `output_mode=ros1` 后，播放将发布到 `AudioConfig.ros1_topic`。
 - 需要 ROS1 环境与 `rospy`，主题类型优先使用 `audio_msgs/AudioData`，缺失时使用 `std_msgs/ByteMultiArray`。
 - 若 ROS 不可用，播放自动回落到本地 `pyaudio`。
+- 全双工模式下会同时发布 `/audio/control` 停播消息；下位机 `robot/ros_audio_player.py` 收到后会立即清队列、重开扬声器流，并丢弃晚到的旧代次音频。
+- 如果 ROS 麦克风输入端一次发布过大的音频包，打断响应仍会变钝；建议上游也按 10-20ms 小包发布。
 
 ### LLM 文本流（新增）
 

@@ -1,30 +1,34 @@
 # -*- coding: utf-8 -*-
-"""
-级联式武汉话实时语音对话系统 - 主入口
-豆包ASR → 千问LLM → 讯飞TTS（武汉话）
-"""
+"""级联式实时语音对话系统主入口。"""
 
 import argparse
 import asyncio
 import logging
 import signal
 import sys
+from collections import deque
 from typing import Optional
 
 import numpy as np
 from scipy import signal as scipy_signal
 
-from asr_client import ASRClient, ASRResponse, get_asr_keyword_detector
-from audio_manager import AudioCapture, AudioPlayer, RealtimeAudioPlaySession, SimpleVAD
+from asr_client import ASRClient, get_asr_keyword_detector
+from audio_manager import AudioCapture, SimpleVAD
 from config import SystemConfig, get_config
-from conversation import DialogEvent, DialogManager, DialogState, create_dialog_queues
+from conversation import (
+    BargeInDetector,
+    DialogEvent,
+    DialogManager,
+    DialogState,
+    create_dialog_queues,
+)
 from dialog_logger import DialogFileLogger
-from llm_client import LLMClient, RAGInterface, RealtimeLLMSession, SimpleRAG
+from dialog_messages import LLMSentence, TTSChunk, UserTurn, WELCOME_UTTERANCE_ID
+from duplex_sessions import RealtimeAudioPlaySession, RealtimeLLMSession, RealtimeTTSSession
+from llm_client import RAGInterface
 from ros_dialog import Ros1DialogTextPublisher
 from ros_dialog import is_ros_available as is_ros_dialog_available
-from tts_client import RealtimeTTSSession, TextPreprocessor, TTSClient
 
-# 配置日志
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -39,81 +43,122 @@ logger = logging.getLogger(__name__)
 
 
 class VoiceDialogSystem:
-    """
-    武汉话实时语音对话系统
-    整合ASR、LLM、TTS三个模块，实现流式语音对话
-    """
+    """整合 ASR/LLM/TTS 的实时对话系统。"""
 
     def __init__(self, config: Optional[SystemConfig] = None):
         self.config = config or get_config()
 
-        # 创建队列
         self.queues = create_dialog_queues()
-        self.audio_queue = self.queues["audio"]  # 麦克风 -> VAD/ASR
-        self.asr_queue = self.queues["asr"]  # ASR -> LLM
-        self.llm_queue = self.queues["llm"]  # LLM -> TTS
-        self.tts_queue = self.queues["tts"]  # TTS -> 播放
+        self.audio_queue = self.queues["audio"]
+        self.asr_queue = self.queues["asr"]
+        self.llm_queue = self.queues["llm"]
+        self.tts_queue = self.queues["tts"]
 
-        # 对话管理
         self.dialog_manager = DialogManager(self.config)
         self.vad = SimpleVAD(threshold=self.config.asr.vad_silence_threshold)
+        self.barge_in_detector = BargeInDetector(
+            threshold=self.config.barge_in_threshold,
+            min_duration_ms=self.config.barge_in_min_duration_ms,
+            sample_rate=self.config.audio.sample_rate,
+            sample_width=self.config.audio.sample_width,
+            frame_duration_ms=self.config.audio.input_chunk_ms,
+        )
         self._asr_kw_detector = get_asr_keyword_detector()
 
-        # 组件（延迟初始化）
         self.audio_capture: Optional[AudioCapture] = None
         self.audio_player: Optional[RealtimeAudioPlaySession] = None
-        self.asr_client: Optional[ASRClient] = None
         self.llm_session: Optional[RealtimeLLMSession] = None
         self.tts_session: Optional[RealtimeTTSSession] = None
         self.dialog_logger: Optional[DialogFileLogger] = None
         self.dialog_text_pub: Optional[Ros1DialogTextPublisher] = None
 
-        # RAG（可选）
         self.rag: Optional[RAGInterface] = None
 
-        # 运行状态
         self._running = False
         self._tasks = []
+        self._background_tasks = set()
 
-        # 当前对话状态
-        self._current_text = ""
         self._is_listening = False
         self._silence_frames = 0
+        self._current_audio_buffer = []
+        self._preroll_frames = deque(
+            maxlen=max(
+                1,
+                int(
+                    self.config.barge_in_preroll_ms
+                    / max(1, self.config.audio.input_chunk_ms)
+                ),
+            )
+        )
+        self._next_utterance_id = 1
+        self._active_robot_utterance_id: Optional[int] = None
 
     def set_rag(self, rag: RAGInterface) -> None:
-        """设置RAG实现"""
         self.rag = rag
         if self.llm_session:
             self.llm_session.set_rag(rag)
         self.config.rag.enabled = True
-        logger.info("RAG已启用")
+        logger.info("RAG enabled")
 
     def switch_model(self, model_name: str) -> bool:
-        """
-        切换LLM模型
-
-        Args:
-            model_name: 模型名称 (qwen-flash, qwen-turbo, qwen-plus, qwen-max)
-
-        Returns:
-            是否切换成功
-        """
         if self.config.llm.switch_model(model_name):
             if self.llm_session:
-                self.llm_session.client.config.model = model_name
-            logger.info(f"已切换到模型: {model_name}")
+                self.llm_session.switch_model(model_name)
+            logger.info("Switched model to %s", model_name)
             return True
-        logger.warning(f"不支持的模型: {model_name}")
+        logger.warning("Unsupported model: %s", model_name)
         return False
 
+    def _allocate_utterance_id(self) -> int:
+        utterance_id = self._next_utterance_id
+        self._next_utterance_id += 1
+        return utterance_id
+
+    def _is_utterance_active(self, utterance_id: int) -> bool:
+        return (
+            self._active_robot_utterance_id is not None
+            and int(utterance_id) == int(self._active_robot_utterance_id)
+        )
+
+    def _track_background_task(self, task: asyncio.Task) -> None:
+        self._background_tasks.add(task)
+        task.add_done_callback(self._background_tasks.discard)
+
+    def _drain_async_queue(self, queue: asyncio.Queue) -> None:
+        while True:
+            try:
+                queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+
+    async def interrupt_current_utterance(self, reason: str = "barge_in") -> None:
+        utterance_id = self._active_robot_utterance_id
+        if utterance_id is None:
+            return
+
+        logger.info(
+            "Interrupt current reply: utterance_id=%s reason=%s",
+            utterance_id,
+            reason,
+        )
+        self._active_robot_utterance_id = None
+        self.barge_in_detector.reset()
+
+        if self.llm_session:
+            await self.llm_session.interrupt(utterance_id)
+        if self.tts_session:
+            await self.tts_session.interrupt(utterance_id)
+        if self.audio_player:
+            self.audio_player.interrupt(utterance_id=utterance_id, reason=reason)
+
+        self._drain_async_queue(self.llm_queue)
+        self._drain_async_queue(self.tts_queue)
+
     def _init_components(self) -> None:
-        """初始化组件"""
         loop = asyncio.get_running_loop()
 
-        # 对话文本落盘（追加写入，不覆盖）
         self.dialog_logger = DialogFileLogger(file_path="dialog.txt")
 
-        # ROS 文本流发布器（不影响原有音频发布链路）
         if (
             self.config.audio.output_mode.lower() == "ros1"
             and is_ros_dialog_available()
@@ -126,16 +171,14 @@ class VoiceDialogSystem:
                 )
             except Exception as e:
                 self.dialog_text_pub = None
-                logger.warning("ROS文本流发布器初始化失败: %s", e)
+                logger.warning("Failed to init ROS text publisher: %s", e)
 
-        # 音频采集（带回声消除）
         self.audio_capture = AudioCapture(
             output_queue=self.audio_queue,
             config=self.config.audio,
             loop=loop,
         )
 
-        # 音频播放（提供AEC参考信号回调）
         self.audio_player = RealtimeAudioPlaySession(
             input_queue=self.tts_queue,
             config=self.config.audio,
@@ -144,165 +187,168 @@ class VoiceDialogSystem:
                 if self.audio_capture
                 else None
             ),
+            on_playback_end=self._on_playback_end,
+            is_utterance_active=self._is_utterance_active,
         )
 
-        # ASR客户端
-        self.asr_client = ASRClient(self.config.asr)
-
-        # LLM会话
         self.llm_session = RealtimeLLMSession(
             input_queue=self.asr_queue,
             output_queue=self.llm_queue,
             config=self.config.llm,
             rag=self.rag,
             on_stream_text=self._on_llm_stream_text,
+            is_utterance_active=self._is_utterance_active,
         )
 
-        # TTS会话
         self.tts_session = RealtimeTTSSession(
             input_queue=self.llm_queue,
             output_queue=self.tts_queue,
             config=self.config.tts,
             on_tts_start=self._on_tts_start,
-            on_tts_end=self._on_tts_end,
+            is_utterance_active=self._is_utterance_active,
         )
 
-        # 注册打断回调
         self.dialog_manager.register_callback(DialogEvent.BARGE_IN, self._on_barge_in)
 
     async def _on_barge_in(self, event: DialogEvent, data) -> None:
-        """打断回调"""
-        logger.info("检测到用户打断")
-        if self.tts_session:
-            self.tts_session.interrupt()
-        if self.audio_player:
-            self.audio_player.interrupt()
+        logger.info("Detected user barge-in")
+        await self.interrupt_current_utterance(reason="barge_in")
 
-    async def _on_tts_start(self, text: str) -> None:
-        """TTS开始时通知状态机进入SPEAKING"""
-        await self.dialog_manager.handle_llm_sentence(text)
+    async def _on_tts_start(self, sentence: LLMSentence) -> None:
+        if sentence.text:
+            await self.dialog_manager.handle_llm_sentence(sentence.text)
 
-    async def _on_tts_end(self) -> None:
-        """TTS结束时回到IDLE"""
-        await self.dialog_manager.handle_tts_end()
+    async def _on_playback_end(self, utterance_id: int) -> None:
+        if not self._is_utterance_active(utterance_id):
+            return
 
-    async def _on_llm_stream_text(self, text: str, is_final: bool) -> None:
-        """LLM流式文本事件：发布到ROS，并将句终文本写入 dialog.txt"""
+        self._active_robot_utterance_id = None
+        if self.dialog_manager.current_state == DialogState.SPEAKING:
+            await self.dialog_manager.handle_tts_end()
+        elif self.dialog_manager.current_state == DialogState.THINKING:
+            await self.dialog_manager.reset()
+
+    async def _on_llm_stream_text(
+        self,
+        utterance_id: int,
+        text: str,
+        is_final: bool,
+    ) -> None:
         if self.dialog_text_pub:
-            self.dialog_text_pub.publish_text(text, is_final)
+            self.dialog_text_pub.publish_text(text, is_final, utterance_id)
 
-        # 句终写入，降低I/O开销；满足每次写入换行与说话人前缀
         if is_final and text and self.dialog_logger:
             await self.dialog_logger.log_line("BOT", text)
 
     async def start(self) -> None:
-        """启动系统"""
         if self._running:
             return
 
         logger.info("=" * 50)
-        logger.info("武汉话实时语音对话系统启动中...")
+        logger.info("Starting realtime voice dialog system...")
         logger.info("=" * 50)
 
         self._running = True
         self._init_components()
 
-        # 启动对话落盘后台任务
         if self.dialog_logger:
             await self.dialog_logger.start()
 
-        # 启动音频采集
         self.audio_capture.start()
-
-        # 启动各个会话
         await self.llm_session.start()
         await self.tts_session.start()
         await self.audio_player.start()
 
-        # 启动主处理循环
         self._tasks = [
             asyncio.create_task(self._vad_loop()),
-            asyncio.create_task(self._asr_loop()),
             asyncio.create_task(self._heartbeat()),
         ]
 
-        logger.info("-" * 50)
-        logger.info(f"模型: {self.config.llm.model} | TTS: {self.config.tts.vcn}")
         logger.info(
-            f"回声消除: {'ON' if self.config.audio.enable_aec else 'OFF'} | 打断: {'ON' if self.config.enable_barge_in else 'OFF'}"
+            "Model=%s | TTS=%s | duplex=%s | input=%s | output=%s",
+            self.config.llm.model,
+            self.config.tts.vcn,
+            self.config.duplex_mode,
+            self.config.audio.input_mode,
+            self.config.audio.output_mode,
         )
-        logger.info(
-            f"关键词检测: {'ON' if self.config.enable_keyword_detection else 'OFF'}"
-        )
-        logger.info(f"输出模式: {self.config.audio.output_mode}")
-        logger.info("-" * 50)
 
-        # 播放启动欢迎语（非阻塞方式）
         if self.config.welcome_message:
-            asyncio.create_task(self._play_welcome_message())
-            # 给欢迎语一点时间开始播放
-            await asyncio.sleep(0.1)
+            welcome_task = asyncio.create_task(self._play_welcome_message())
+            self._track_background_task(welcome_task)
+            await asyncio.sleep(0.05)
 
-        logger.info("系统就绪，请开始说话...")
+        logger.info("System ready, please start speaking.")
 
     async def _play_welcome_message(self) -> None:
-        """播放启动欢迎语"""
-        welcome_text = self.config.welcome_message
-        logger.info(f"[欢迎语] 开始合成: {welcome_text}")
+        welcome_text = (self.config.welcome_message or "").strip()
+        if not welcome_text or not self.tts_session:
+            return
+
+        logger.info("[Welcome] Synthesizing startup prompt")
+        self._active_robot_utterance_id = WELCOME_UTTERANCE_ID
 
         try:
-            # 直接使用 TTS 客户端合成音频并推送到播放队列
-            chunk_count = 0
-            agen = self.tts_session.client.synthesize(welcome_text)
-            try:
-                first_chunk = await asyncio.wait_for(agen.__anext__(), timeout=5.0)
-            except asyncio.TimeoutError:
-                logger.error("[欢迎语] TTS 首包超时，已跳过欢迎语")
-                return
-            except StopAsyncIteration:
-                logger.warning("[欢迎语] TTS 未返回音频")
-                return
+            chunk_seq = 0
+            async for audio_chunk in self.tts_session.client.synthesize(welcome_text):
+                if not self._is_utterance_active(WELCOME_UTTERANCE_ID):
+                    break
+                await self.tts_queue.put(
+                    TTSChunk(
+                        utterance_id=WELCOME_UTTERANCE_ID,
+                        chunk_seq=chunk_seq,
+                        audio_bytes=audio_chunk,
+                        is_last=False,
+                    )
+                )
+                chunk_seq += 1
 
-            await self.tts_queue.put(first_chunk)
-            chunk_count += 1
-
-            async for audio_chunk in agen:
-                await self.tts_queue.put(audio_chunk)
-                chunk_count += 1
-
-            # 发送一轮结束标记，触发播放完成回调
-            await self.tts_queue.put(None)
-            logger.info(f"[欢迎语] 合成完成，共 {chunk_count} 个音频块")
-
+            if self._is_utterance_active(WELCOME_UTTERANCE_ID):
+                await self.tts_queue.put(
+                    TTSChunk(
+                        utterance_id=WELCOME_UTTERANCE_ID,
+                        chunk_seq=chunk_seq,
+                        audio_bytes=b"",
+                        is_last=True,
+                    )
+                )
+        except asyncio.CancelledError:
+            raise
         except Exception as e:
-            logger.error(f"[欢迎语] 播放失败: {e}")
+            logger.error("[Welcome] Playback failed: %s", e)
+            if self._is_utterance_active(WELCOME_UTTERANCE_ID):
+                self._active_robot_utterance_id = None
 
     async def _heartbeat(self) -> None:
-        """运行心跳日志，便于判断是否卡住"""
         while self._running:
             try:
                 await asyncio.sleep(5)
-                logger.info("系统运行中...")
+                logger.info("System heartbeat")
             except asyncio.CancelledError:
                 break
 
     async def stop(self) -> None:
-        """停止系统"""
         if not self._running:
             return
 
-        logger.info("正在停止系统...")
+        logger.info("Stopping system...")
         self._running = False
 
-        # 取消任务
+        await self.interrupt_current_utterance(reason="shutdown")
+
         for task in self._tasks:
             task.cancel()
+        for task in list(self._background_tasks):
+            task.cancel()
+
+        for task in self._tasks + list(self._background_tasks):
             try:
                 await task
             except asyncio.CancelledError:
                 pass
+            except Exception as e:
+                logger.warning("Background task stopped with error: %s", e)
 
-        # 停止组件
         if self.audio_capture:
             self.audio_capture.stop()
         if self.audio_player:
@@ -311,104 +357,112 @@ class VoiceDialogSystem:
             await self.llm_session.stop()
         if self.tts_session:
             await self.tts_session.stop()
-        if self.asr_client:
-            await self.asr_client.close()
         if self.dialog_logger:
             await self.dialog_logger.stop()
         if self.dialog_text_pub:
             self.dialog_text_pub.close()
 
-        logger.info("系统已停止")
+        logger.info("System stopped")
 
     async def _vad_loop(self) -> None:
-        """VAD检测循环"""
-        max_silence_frames = int(
-            self.config.asr.max_silence_ms / self.config.audio.input_chunk_ms
+        max_silence_frames = max(
+            1,
+            int(self.config.asr.max_silence_ms / self.config.audio.input_chunk_ms),
+        )
+        full_duplex_enabled = (
+            (self.config.duplex_mode or "half").lower() == "full"
+            and self.config.enable_barge_in
         )
 
         while self._running:
             try:
-                # 获取音频帧
                 audio_frame = await self.audio_queue.get()
-
                 if not audio_frame:
                     continue
 
-                # VAD检测
+                self._preroll_frames.append(audio_frame)
                 is_speech = self.vad.is_speech(audio_frame)
+                state = self.dialog_manager.current_state
 
-                # 检查是否需要打断
-                if self.dialog_manager.is_speaking and is_speech:
-                    if self.config.enable_barge_in:
+                if full_duplex_enabled and state in (
+                    DialogState.THINKING,
+                    DialogState.SPEAKING,
+                ):
+                    playback_floor = (
+                        self.audio_capture.get_playback_reference_level()
+                        if self.audio_capture
+                        else 0.0
+                    )
+                    if is_speech and self.barge_in_detector.detect(
+                        audio_frame,
+                        playback_leak_floor=playback_floor,
+                        echo_ratio=self.config.barge_in_echo_ratio,
+                    ):
                         await self.dialog_manager.handle_barge_in()
-                        self.tts_session.resume()
-                        self.audio_player.resume()
+                        self._is_listening = True
+                        self._silence_frames = 0
+                        self._current_audio_buffer = list(self._preroll_frames)
+                        self.barge_in_detector.reset()
+                        continue
 
-                # 状态处理
-                if self.dialog_manager.current_state == DialogState.IDLE:
+                    if not is_speech:
+                        self.barge_in_detector.reset()
+                    continue
+
+                self.barge_in_detector.reset()
+
+                if state == DialogState.IDLE:
                     if is_speech:
-                        # 开始说话
                         await self.dialog_manager.handle_voice_start()
                         self._is_listening = True
                         self._silence_frames = 0
-                        self._current_audio_buffer = [audio_frame]
+                        self._current_audio_buffer = list(self._preroll_frames)
+                        continue
 
-                elif self.dialog_manager.current_state == DialogState.LISTENING:
-                    if is_speech:
-                        self._silence_frames = 0
-                        self._current_audio_buffer.append(audio_frame)
-                    else:
-                        self._silence_frames += 1
-                        self._current_audio_buffer.append(audio_frame)
+                if self.dialog_manager.current_state != DialogState.LISTENING:
+                    continue
 
-                        # 检查是否说话结束
-                        if self._silence_frames >= max_silence_frames:
-                            await self.dialog_manager.handle_voice_end()
-                            self._is_listening = False
+                self._current_audio_buffer.append(audio_frame)
+                if is_speech:
+                    self._silence_frames = 0
+                else:
+                    self._silence_frames += 1
 
-                            # 将音频发送到ASR
-                            audio_data = b"".join(self._current_audio_buffer)
-                            await self._process_audio(audio_data)
-                            self._current_audio_buffer = []
+                if self._silence_frames < max_silence_frames:
+                    continue
+
+                await self.dialog_manager.handle_voice_end()
+                self._is_listening = False
+                self._silence_frames = 0
+
+                audio_data = b"".join(self._current_audio_buffer)
+                self._current_audio_buffer = []
+
+                process_task = asyncio.create_task(self._process_audio(audio_data))
+                self._track_background_task(process_task)
 
             except asyncio.CancelledError:
                 break
             except Exception as e:
-                logger.error(f"VAD循环出错: {e}")
+                logger.error("VAD loop error: %s", e)
 
     async def _process_audio(self, audio_data: bytes) -> None:
-        """处理录制的音频"""
         if not audio_data:
             await self.dialog_manager.reset()
             return
 
-        logger.debug(
-            f"开始ASR识别，音频: {len(audio_data)} bytes @ {self.config.audio.sample_rate}Hz"
-        )
-
-        # 重采样：从麦克风采样率转换到ASR期望的采样率
         if self.config.audio.sample_rate != self.config.asr.sample_rate:
             try:
-                # 转换为numpy数组
                 audio_array = np.frombuffer(audio_data, dtype=np.int16)
-
-                # 计算重采样比例
                 resample_ratio = (
                     self.config.asr.sample_rate / self.config.audio.sample_rate
                 )
-                new_length = int(len(audio_array) * resample_ratio)
-
-                # 使用scipy进行重采样
-                resampled_array = scipy_signal.resample(audio_array, new_length)
-
-                # 转换回int16并转为bytes
-                audio_data = resampled_array.astype(np.int16).tobytes()
-
-                logger.debug(
-                    f"重采样: {self.config.audio.sample_rate}Hz → {self.config.asr.sample_rate}Hz"
-                )
+                new_length = max(1, int(len(audio_array) * resample_ratio))
+                audio_data = scipy_signal.resample(audio_array, new_length).astype(
+                    np.int16
+                ).tobytes()
             except Exception as e:
-                logger.error(f"重采样失败: {e}")
+                logger.error("Failed to resample audio for ASR: %s", e)
                 await self.dialog_manager.reset()
                 return
 
@@ -416,95 +470,62 @@ class VoiceDialogSystem:
             async with ASRClient(self.config.asr) as client:
                 await client.initialize()
 
-                # 分片发送音频（使用ASR采样率计算）
                 segment_size = int(
                     self.config.asr.sample_rate
                     * self.config.audio.sample_width
                     * self.config.asr.segment_duration_ms
                     / 1000
                 )
-
                 segments = [
                     audio_data[i : i + segment_size]
                     for i in range(0, len(audio_data), segment_size)
                 ]
 
                 for i, segment in enumerate(segments):
-                    is_last = i == len(segments) - 1
-                    await client.send_audio(segment, is_last)
+                    await client.send_audio(segment, i == len(segments) - 1)
 
-                # 接收识别结果
                 final_text = ""
                 async for resp in client.receive_responses():
                     if resp.code != 0:
-                        err_detail = None
+                        detail = None
                         if resp.payload_msg:
-                            err_detail = (
+                            detail = (
                                 resp.payload_msg.get("message")
                                 or resp.payload_msg.get("msg")
                                 or resp.payload_msg
                             )
-                        if err_detail:
-                            logger.error(f"ASR错误: {resp.code}, 详情: {err_detail}")
-                        else:
-                            logger.error(f"ASR错误: {resp.code}")
+                        logger.error("ASR error %s: %s", resp.code, detail or "unknown")
                         break
-
-                    text = resp.get_text()
-                    if text:
-                        logger.debug(f"ASR中间结果: {text}")
 
                     if resp.is_last_package:
                         final_text = resp.get_text()
                         break
 
-                if final_text:
-                    logger.info(f"[ASR] 用户: {final_text}")
-                    await self.dialog_manager.handle_asr_result(final_text)
-
-                    # 记录用户文本（追加写入，不覆盖）
-                    if self.dialog_logger:
-                        await self.dialog_logger.log_line("USER", final_text)
-
-                    # 标记新一轮机器人输出（用于ROS文本流分轮）
-                    if self.dialog_text_pub:
-                        self.dialog_text_pub.start_new_utterance()
-
-                    # ASR关键词检测（触发UDP动作）
-                    self._asr_kw_detector.detect_and_emit(final_text)
-
-                    # 发送到LLM
-                    await self.asr_queue.put(final_text)
-                else:
-                    logger.debug("ASR未识别到有效文本")
+                if not final_text:
+                    logger.debug("ASR produced no final text")
                     await self.dialog_manager.reset()
+                    return
 
+                logger.info("[ASR] User: %s", final_text)
+                utterance_id = self._allocate_utterance_id()
+                self._active_robot_utterance_id = utterance_id
+                self.barge_in_detector.reset()
+
+                await self.dialog_manager.handle_asr_result(final_text)
+
+                if self.dialog_logger:
+                    await self.dialog_logger.log_line("USER", final_text)
+
+                self._asr_kw_detector.detect_and_emit(final_text)
+                await self.asr_queue.put(UserTurn(utterance_id, final_text))
+
+        except asyncio.CancelledError:
+            raise
         except Exception as e:
-            logger.error(f"ASR处理出错: {e}")
+            logger.error("ASR processing error: %s", e)
             await self.dialog_manager.reset()
 
-    async def _asr_loop(self) -> None:
-        """ASR结果处理循环（监控LLM输出触发状态更新）"""
-        while self._running:
-            try:
-                await asyncio.sleep(0.1)
-
-                # 检查TTS队列是否有结束标记
-                if self.dialog_manager.current_state == DialogState.SPEAKING:
-                    # 简单检测播放是否结束
-                    if (
-                        self.tts_queue.empty()
-                        and not self.audio_player.player.is_playing
-                    ):
-                        await self.dialog_manager.handle_tts_end()
-
-            except asyncio.CancelledError:
-                break
-            except Exception as e:
-                logger.error(f"ASR循环出错: {e}")
-
     def list_audio_devices(self) -> None:
-        """列出可用音频设备"""
         import pyaudio
 
         pa = pyaudio.PyAudio()
@@ -513,88 +534,97 @@ class VoiceDialogSystem:
         for i in range(pa.get_device_count()):
             info = pa.get_device_info_by_index(i)
             if info["maxInputChannels"] > 0:
-                print(
-                    f"  [{i}] {info['name']} (采样率: {int(info['defaultSampleRate'])})"
-                )
+                print(f"  [{i}] {info['name']} (采样率: {int(info['defaultSampleRate'])})")
 
         print("\n=== 输出设备 ===")
         for i in range(pa.get_device_count()):
             info = pa.get_device_info_by_index(i)
             if info["maxOutputChannels"] > 0:
-                print(
-                    f"  [{i}] {info['name']} (采样率: {int(info['defaultSampleRate'])})"
-                )
+                print(f"  [{i}] {info['name']} (采样率: {int(info['defaultSampleRate'])})")
 
         pa.terminate()
 
     def get_stats(self) -> dict:
-        """获取统计信息"""
         return self.dialog_manager.get_stats()
 
 
-async def main():
-    """主函数"""
+async def main() -> None:
     parser = argparse.ArgumentParser(
-        description="武汉话实时语音对话系统",
+        description="Realtime cascaded speech dialog system",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
-示例:
-  python main.py                    # 使用默认配置启动
-  python main.py --model qwen-plus  # 使用qwen-plus模型
-  python main.py --list-devices     # 列出音频设备
-  python main.py --input-device 1   # 指定输入设备
+Examples:
+  python main.py
+  python main.py --model qwen-plus
+  python main.py --duplex-mode full
+  python main.py --list-devices
         """,
     )
 
-    # 模型选择
     parser.add_argument(
         "--model",
         "-m",
         type=str,
         default="qwen-flash",
         choices=["qwen-flash", "qwen-turbo", "qwen-plus", "qwen-max"],
-        help="LLM模型 (默认: qwen-flash，更快；qwen-plus更准确)",
-    )
-
-    # 音频设备
-    parser.add_argument(
-        "--list-devices", "-l", action="store_true", help="列出可用音频设备"
+        help="LLM model",
     )
     parser.add_argument(
-        "--input-device", "-i", type=int, default=None, help="输入设备索引"
+        "--list-devices",
+        "-l",
+        action="store_true",
+        help="List available audio devices",
     )
     parser.add_argument(
-        "--output-device", "-o", type=int, default=None, help="输出设备索引"
+        "--input-device",
+        "-i",
+        type=int,
+        default=None,
+        help="Input device index",
     )
-
-    # VAD参数
     parser.add_argument(
-        "--vad-threshold", type=int, default=500, help="VAD能量阈值 (默认: 500)"
+        "--output-device",
+        "-o",
+        type=int,
+        default=None,
+        help="Output device index",
     )
     parser.add_argument(
-        "--silence-ms", type=int, default=500, help="静音判停时间(ms) (默认: 500)"
+        "--vad-threshold",
+        type=int,
+        default=500,
+        help="VAD energy threshold",
     )
-
-    # 功能开关
-    parser.add_argument("--no-aec", action="store_true", help="禁用回声消除")
-    parser.add_argument("--no-barge-in", action="store_true", help="禁用打断功能")
-
-    # 日志级别
-    parser.add_argument("--debug", action="store_true", help="启用调试日志")
+    parser.add_argument(
+        "--silence-ms",
+        type=int,
+        default=500,
+        help="Silence duration that ends a user turn",
+    )
+    parser.add_argument(
+        "--duplex-mode",
+        choices=["half", "full"],
+        default="half",
+        help="Dialog duplex mode",
+    )
+    parser.add_argument("--no-aec", action="store_true", help="Disable AEC")
+    parser.add_argument(
+        "--no-barge-in",
+        action="store_true",
+        help="Compatibility alias: force half-duplex mode",
+    )
+    parser.add_argument("--debug", action="store_true", help="Enable debug logging")
 
     args = parser.parse_args()
 
-    # 设置日志级别
     if args.debug:
         logging.getLogger().setLevel(logging.DEBUG)
 
-    # 列出设备
     if args.list_devices:
         system = VoiceDialogSystem()
         system.list_audio_devices()
         return
 
-    # 更新配置
     config = get_config()
     config.llm.model = args.model
     config.audio.input_device_index = args.input_device
@@ -602,35 +632,33 @@ async def main():
     config.asr.vad_silence_threshold = args.vad_threshold
     config.asr.max_silence_ms = args.silence_ms
     config.audio.enable_aec = not args.no_aec
-    config.enable_barge_in = not args.no_barge_in
 
-    # 创建系统
+    if args.no_barge_in:
+        config.duplex_mode = "half"
+        config.enable_barge_in = False
+    else:
+        config.duplex_mode = args.duplex_mode
+        config.enable_barge_in = config.duplex_mode == "full"
+
     system = VoiceDialogSystem(config)
-
-    # 设置信号处理
     loop = asyncio.get_running_loop()
 
     async def shutdown():
-        logger.info("收到退出信号...")
+        logger.info("Shutdown signal received")
         await system.stop()
 
-    # Windows不支持add_signal_handler，使用try-except
     try:
         for sig in (signal.SIGINT, signal.SIGTERM):
             loop.add_signal_handler(sig, lambda: asyncio.create_task(shutdown()))
     except NotImplementedError:
-        # Windows fallback
         pass
 
     try:
         await system.start()
-
-        # 保持运行
         while system._running:
             await asyncio.sleep(1)
-
     except KeyboardInterrupt:
-        logger.info("用户中断")
+        logger.info("Interrupted by user")
     finally:
         await system.stop()
 

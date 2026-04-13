@@ -13,6 +13,7 @@ from typing import Any, AsyncGenerator, Callable, Dict, List, Optional
 from openai import AsyncOpenAI
 
 from config import LLMConfig, RAGConfig, get_config
+from dialog_messages import LLMSentence, UserTurn
 
 logger = logging.getLogger(__name__)
 
@@ -392,23 +393,35 @@ class RealtimeLLMSession:
         output_queue: asyncio.Queue,
         config: Optional[LLMConfig] = None,
         rag: Optional[RAGInterface] = None,
-        on_stream_text: Optional[Callable[[str, bool], Any]] = None,
+        on_stream_text: Optional[Callable[[int, str, bool], Any]] = None,
+        is_utterance_active: Optional[Callable[[int], bool]] = None,
     ):
         self.input_queue = input_queue
         self.output_queue = output_queue
         self.client = LLMClient(config, rag)
         self.splitter = SentenceSplitter()
         self._on_stream_text = on_stream_text
+        self._is_utterance_active = is_utterance_active or (lambda utterance_id: True)
         self._running = False
         self._task: Optional[asyncio.Task] = None
+        self._current_task: Optional[asyncio.Task] = None
+        self._current_utterance_id: Optional[int] = None
 
-    async def _emit_stream_text(self, text: str, is_final: bool) -> None:
+    def _can_emit(self, utterance_id: int) -> bool:
+        return self._is_utterance_active(int(utterance_id))
+
+    async def _emit_stream_text(
+        self,
+        utterance_id: int,
+        text: str,
+        is_final: bool,
+    ) -> None:
         """发出流式文本事件（chunk 或 句终）"""
         if not self._on_stream_text:
             return
 
         try:
-            res = self._on_stream_text(text, is_final)
+            res = self._on_stream_text(utterance_id, text, is_final)
             if asyncio.iscoroutine(res):
                 await res
         except Exception as e:
@@ -426,6 +439,7 @@ class RealtimeLLMSession:
     async def stop(self) -> None:
         """停止LLM会话"""
         self._running = False
+        await self.interrupt()
         if self._task:
             self._task.cancel()
             try:
@@ -446,44 +460,93 @@ class RealtimeLLMSession:
         """清空对话历史"""
         self.client.clear_history()
 
+    async def interrupt(self, utterance_id: Optional[int] = None) -> None:
+        """Cancel the active LLM response task."""
+        if (
+            self._current_task
+            and not self._current_task.done()
+            and (utterance_id is None or utterance_id == self._current_utterance_id)
+        ):
+            self._current_task.cancel()
+            try:
+                await self._current_task
+            except asyncio.CancelledError:
+                pass
+        self._current_task = None
+        self._current_utterance_id = None
+        self.splitter.reset()
+
+    async def _run_response(self, user_turn: UserTurn) -> None:
+        use_rag = get_config().rag.enabled
+
+        async for chunk in self.client.chat_stream(user_turn.text, use_rag):
+            if not self._can_emit(user_turn.utterance_id):
+                raise asyncio.CancelledError()
+
+            await self._emit_stream_text(user_turn.utterance_id, chunk, False)
+
+            sentences = self.splitter.feed(chunk)
+            for sentence in sentences:
+                if not self._can_emit(user_turn.utterance_id):
+                    raise asyncio.CancelledError()
+                await self.output_queue.put(
+                    LLMSentence(
+                        utterance_id=user_turn.utterance_id,
+                        text=sentence,
+                        is_final=False,
+                    )
+                )
+                await self._emit_stream_text(user_turn.utterance_id, sentence, True)
+                logger.info("[LLM] 机器人: %s", sentence)
+
+        remaining = self.splitter.flush()
+        if remaining and self._can_emit(user_turn.utterance_id):
+            await self.output_queue.put(
+                LLMSentence(
+                    utterance_id=user_turn.utterance_id,
+                    text=remaining,
+                    is_final=False,
+                )
+            )
+            await self._emit_stream_text(user_turn.utterance_id, remaining, True)
+            logger.info("[LLM] 机器人: %s", remaining)
+
+        if self._can_emit(user_turn.utterance_id):
+            await self.output_queue.put(
+                LLMSentence(
+                    utterance_id=user_turn.utterance_id,
+                    text="",
+                    is_final=True,
+                )
+            )
+
     async def _run(self) -> None:
         """运行处理循环"""
         while self._running:
             try:
-                # 等待用户输入
-                user_text = await self.input_queue.get()
+                user_turn = await self.input_queue.get()
 
-                if user_text is None:  # 结束信号
+                if user_turn is None:
                     break
 
-                logger.debug(f"LLM收到输入: {user_text}")
+                if not isinstance(user_turn, UserTurn):
+                    user_turn = UserTurn(utterance_id=-1, text=str(user_turn))
 
-                # 重置句子切分器
+                if not self._can_emit(user_turn.utterance_id):
+                    continue
+
                 self.splitter.reset()
-
-                # 流式生成回复
-                use_rag = get_config().rag.enabled
-                async for chunk in self.client.chat_stream(user_text, use_rag):
-                    await self._emit_stream_text(chunk, False)
-
-                    # 按句子切分
-                    sentences = self.splitter.feed(chunk)
-                    for sentence in sentences:
-                        await self.output_queue.put(sentence)
-                        await self._emit_stream_text(sentence, True)
-                        logger.info(f"[LLM] 机器人: {sentence}")
-
-                # 处理剩余文本
-                remaining = self.splitter.flush()
-                if remaining:
-                    await self.output_queue.put(remaining)
-                    await self._emit_stream_text(remaining, True)
-                    logger.info(f"[LLM] 机器人: {remaining}")
-
-                # 发送结束标记
-                await self.output_queue.put(None)
+                self._current_utterance_id = user_turn.utterance_id
+                self._current_task = asyncio.create_task(self._run_response(user_turn))
+                try:
+                    await self._current_task
+                except asyncio.CancelledError:
+                    logger.debug("LLM response interrupted")
+                finally:
+                    self._current_task = None
+                    self._current_utterance_id = None
 
             except asyncio.CancelledError:
                 break
             except Exception as e:
-                logger.error(f"LLM处理出错: {e}")
+                logger.error("LLM处理出错: %s", e)

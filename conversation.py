@@ -243,7 +243,6 @@ class DialogManager:
             await self._trigger_event(DialogEvent.BARGE_IN)
 
             # 短暂延迟后转为监听
-            await asyncio.sleep(0.1)
             await self.transition_to(DialogState.LISTENING)
 
     async def reset(self) -> None:
@@ -278,18 +277,26 @@ class BargeInDetector:
         min_duration_ms: int = 100,
         sample_rate: int = 16000,
         sample_width: int = 2,
+        frame_duration_ms: int = 20,
     ):
         self.threshold = threshold
         self.min_duration_ms = min_duration_ms
         self.sample_rate = sample_rate
         self.sample_width = sample_width
+        self.frame_duration_ms = max(1, frame_duration_ms)
 
         self._consecutive_frames = 0
-        self._frames_needed = int(
-            min_duration_ms * sample_rate / 1000 / 320
+        self._frames_needed = max(
+            1,
+            int((min_duration_ms + self.frame_duration_ms - 1) / self.frame_duration_ms),
         )  # 假设每帧320采样
 
-    def detect(self, audio_data: bytes) -> bool:
+    def detect(
+        self,
+        audio_data: bytes,
+        playback_leak_floor: float = 0.0,
+        echo_ratio: float = 1.0,
+    ) -> bool:
         """
         检测是否有打断意图
 
@@ -304,8 +311,12 @@ class BargeInDetector:
             return False
 
         rms = audioop.rms(audio_data, self.sample_width)
+        dynamic_threshold = max(
+            float(self.threshold),
+            float(playback_leak_floor) * float(echo_ratio),
+        )
 
-        if rms > self.threshold:
+        if rms > dynamic_threshold:
             self._consecutive_frames += 1
             if self._consecutive_frames >= self._frames_needed:
                 self._consecutive_frames = 0
